@@ -38,8 +38,20 @@ function refreshData(reason) {
 function dataAgeDays() {
   try { return (Date.now() - fs.statSync(FINANCE_DB).mtimeMs) / 86400000; } catch { return Infinity; }
 }
+// Sources that were skipped (e.g. SEC_USER_AGENT missing) or failed on the last build.
+function incompleteSources() {
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(FINANCE_DB, { readOnly: true });
+    const rows = db.prepare("SELECT table_name, status FROM data_sources WHERE status != 'ok'").all();
+    db.close();
+    return rows.map((r) => `${r.table_name} (${r.status})`);
+  } catch { return []; }
+}
 if (process.env.SKIP_DATA_LOAD !== '1') {
+  const incomplete = finance.exists() ? incompleteSources() : [];
   if (!finance.exists()) refreshData('first run');
+  else if (incomplete.length) refreshData(`retrying incomplete sources: ${incomplete.join(', ')}`);
   else if (dataAgeDays() > REFRESH_DAYS) refreshData('scheduled refresh');
   setInterval(() => { if (dataAgeDays() > REFRESH_DAYS) refreshData('scheduled refresh'); }, 6 * 3600 * 1000).unref();
 }
