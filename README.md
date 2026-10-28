@@ -9,7 +9,7 @@ This is the working version of the *AI Transformation Builder* case study on iam
 | Piece | How it works |
 |---|---|
 | Data | Pulled at first boot from SEC EDGAR (company list, annual and quarterly XBRL "frames", SIC sector codes), Treasury Fiscal Data (quarterly FX), and FRED (yields, fed funds, CPI, unemployment). Sector codes fill in the background after the main load, largest companies first. Refreshed weekly; an older dataset missing new tables is rebuilt automatically. Provenance is shown on the Data sources page. |
-| SQL generation | Claude via the Messages API, forced to answer through a `propose_transformation` tool: SQL, plain-English summary, confidence, and `{line, note, severity}` assumptions. |
+| SQL generation | Claude via the Messages API, answering through a `propose_transformation` tool (offered with `tool_choice: auto`, since Sonnet 5.5 rejects forced tool use): SQL, plain-English summary, confidence, and `{line, note, severity}` assumptions. |
 | Self-repair | Every draft is compiled against the live schema. If SQLite rejects it, the error goes back to Claude once and the repair is logged. |
 | Confidence | Shown as **model-reported**, next to **system checks** the server computes independently (parses against schema, row count, columns that are mostly null, truncation). |
 | Safety | Only single `SELECT`/`WITH` statements; the finance DB is opened read-only in a worker thread that is killed after 4 seconds. |
