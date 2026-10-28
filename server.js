@@ -162,7 +162,7 @@ async function handleGenerate(req, res, sid) {
     if (!result.ok && !result.timeout) {
       repairedError = result.error;
       send({ stage: 'repairing', label: 'First draft failed — asking the AI to fix it', detail: result.error });
-      const fixed = await ai.repair({ schemaText, messages: first.messages, toolUseId: first.toolUseId, rawInput: first.rawInput, error: result.error });
+      const fixed = await ai.repair({ schemaText, messages: first.messages, toolUseId: first.toolUseId, rawInput: first.rawInput, assistantContent: first.assistantContent, error: result.error });
       proposal = fixed.proposal;
       send({ stage: 'validating', label: 'Re-validating' });
       result = await finance.run(proposal.sql, { maxRows: PREVIEW_ROWS });
