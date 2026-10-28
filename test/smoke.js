@@ -74,7 +74,29 @@ async function call(method, path, body) {
   const sch = await call('GET', '/api/schema'); assert.ok(sch.body.tables.length >= 6);
   const list = await call('GET', '/api/transformations'); assert.equal(list.body.length, 2);
 
-  // 7. session isolation
+  // 7. scans, explain, monitors
+  const scans = await call('GET', '/api/scans');
+  assert.ok(scans.body.length >= 10 && scans.body.every((x) => !x.error), JSON.stringify(scans.body.filter((x) => x.error)));
+  const opened = await call('POST', '/api/scans/red_flag_filings/open');
+  assert.equal(opened.body.version.author, 'system'); assert.ok(opened.body.preview.rows.length > 0);
+  assert.ok(opened.body.version.assumptions.every((a) => a.line > 1), 'scan notes resolve to real lines');
+  const ex = await call('POST', `/api/versions/${opened.body.version.id}/explain`);
+  assert.ok(ex.body.headline, JSON.stringify(ex.body));
+  const ex2 = await call('POST', `/api/versions/${opened.body.version.id}/explain`);
+  assert.equal(ex2.body.created_at, ex.body.created_at, 'explanation is cached');
+  let mon = await call('POST', `/api/transformations/${opened.body.transformation.id}/monitor`);
+  assert.equal(mon.status, 400, 'monitor requires an accepted version');
+  await call('POST', `/api/versions/${opened.body.version.id}/accept`, {});
+  mon = await call('POST', `/api/transformations/${opened.body.transformation.id}/monitor`);
+  assert.equal(mon.status, 200); assert.ok(mon.body.last_row_count > 0); assert.equal(mon.body.new_rows, 0);
+  const mons = await call('GET', '/api/monitors'); assert.equal(mons.body.length, 1);
+  const val = await call('POST', '/api/preview', { sql: 'SELECT ticker, market_cap, pe_ratio FROM valuation LIMIT 3' });
+  assert.ok(!val.body.preview.error, val.body.preview.error);
+  const sc = await call('POST', '/api/preview', { sql: 'SELECT ticker, piotroski_f, altman_zone FROM company_scores LIMIT 3' });
+  assert.ok(!sc.body.preview.error, sc.body.preview.error);
+  console.log('✓ scans, explain (cached), monitors, valuation and scores');
+
+  // 8. session isolation
   const saved = cookie; cookie = '';
   const other = await call('GET', `/api/transformations/${tx}`); assert.equal(other.status, 404);
   cookie = saved;

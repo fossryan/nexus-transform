@@ -30,6 +30,10 @@ http.createServer((req, res) => {
       }
     }
     const thinking = { type: 'thinking', thinking: 'Considering the schema…', signature: 'sig' };
+    if (!Array.isArray(body.system) || !body.system[0].cache_control) return send(400, { type: 'error', error: { type: 'invalid_request_error', message: 'test expects a cached system block' } });
+    if (body.tools[0].name === 'explain_results') {
+      return send(200, { content: [thinking, { type: 'tool_use', id: `toolu_x${log.length}`, name: 'explain_results', input: { headline: 'Fake headline', findings: [{ text: 'Finding one' }], caveats: ['Caveat'] } }], stop_reason: 'tool_use' });
+    }
     const first = msgs.length === 1;
     if (first && /prose/.test(lastText)) {
       return send(200, { content: [thinking, { type: 'text', text: 'Here is some SQL in prose.' }], stop_reason: 'end_turn' });

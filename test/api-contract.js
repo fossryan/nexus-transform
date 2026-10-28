@@ -29,6 +29,11 @@ async function gen(prompt) {
   assert.ok(done.done, JSON.stringify(done));
   console.log('✓ repair loop replays thinking block and succeeds');
 
+  const exRes = await fetch(`${BASE}/api/versions/${done.version.id}/explain`, { method: 'POST', headers: { 'content-type': 'application/json', cookie } });
+  const exBody = await exRes.json();
+  assert.equal(exBody.headline, 'Fake headline', JSON.stringify(exBody));
+  console.log('✓ explain uses its own tool and a cached system prompt');
+
   const log = await (await fetch(`${FAKE}/__log`, { method: 'POST', body: '{}' })).json();
   assert.ok(log.every((l) => l.tool_choice.type === 'auto'));
   console.log(`✓ ${log.length} API calls, all tool_choice auto\nALL PASSED`);

@@ -6,7 +6,8 @@ const crypto = require('node:crypto');
 const { createFinance } = require('./lib/finance');
 const { createStore } = require('./lib/store');
 const { createAI } = require('./lib/ai');
-const { buildDatabase, fillSectors, REQUIRED_TABLES } = require('./lib/loader');
+const { createJobs } = require('./lib/jobs');
+const { SCANS, scanNotes } = require('./lib/scans');
 
 const PORT = Number(process.env.PORT || 8080);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -15,7 +16,6 @@ const MOCK_AI = process.env.MOCK_AI === '1';
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
 const MAX_PER_HOUR = Number(process.env.MAX_GENERATIONS_PER_HOUR || 25);
 const MAX_PER_DAY = Number(process.env.MAX_DAILY_GENERATIONS || 400);
-const REFRESH_DAYS = Number(process.env.DATA_REFRESH_DAYS || 7);
 const PREVIEW_ROWS = 500;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -24,61 +24,18 @@ const store = createStore(path.join(DATA_DIR, 'app.db'));
 const ai = createAI({ apiKey: process.env.ANTHROPIC_API_KEY, model: MODEL, mock: MOCK_AI });
 const aiConfigured = MOCK_AI || !!process.env.ANTHROPIC_API_KEY;
 
-// ---------- dataset loading ----------
-const loadState = { loading: false, errors: [], lastBuilt: null, sectors: { running: false, done: 0, total: 0 } };
-function refreshData(reason) {
-  if (loadState.loading) return;
-  loadState.loading = true;
-  console.log(`Building finance dataset (${reason})…`);
-  buildDatabase({ outPath: FINANCE_DB, secUserAgent: process.env.SEC_USER_AGENT, log: (l) => console.log(l) })
-    .then(({ errors }) => { loadState.errors = errors; loadState.lastBuilt = new Date().toISOString(); finance.invalidate(); console.log(`Dataset ready (${errors.length} warnings).`); })
-    .catch((e) => { loadState.errors = [String(e.message || e)]; console.error('Dataset build failed:', e); })
-    .finally(() => { loadState.loading = false; startSectorFill(); });
+// ---------- background data jobs ----------
+let monitorTimer = null;
+const scanCache = { at: 0, results: null };
+function onDataChanged() {
+  finance.invalidate();
+  scanCache.results = null;
+  clearTimeout(monitorTimer); // re-run saved monitors shortly after data changes (debounced)
+  monitorTimer = setTimeout(() => runAllMonitors().catch((e) => console.error('monitors:', e)), 15000);
+  monitorTimer.unref();
 }
-// Sector codes are fetched one company at a time, so they fill in after the main load.
-function startSectorFill() {
-  if (loadState.sectors.running) { loadState.sectors.again = true; return; } // restart once the current run stops
-  if (loadState.loading || !process.env.SEC_USER_AGENT || !finance.exists()) return;
-  loadState.sectors.running = true;
-  loadState.sectors.again = false;
-  fillSectors({
-    dbPath: FINANCE_DB, secUserAgent: process.env.SEC_USER_AGENT, log: (l) => console.log(l),
-    onProgress: (p) => { loadState.sectors.done = p.done; loadState.sectors.total = p.total; finance.invalidate(); },
-    shouldStop: () => loadState.loading,
-  })
-    .catch((e) => console.error('Sector fill failed:', e))
-    .finally(() => {
-      loadState.sectors.running = false;
-      finance.invalidate();
-      if (loadState.sectors.again) startSectorFill();
-    });
-}
-function dataAgeDays() {
-  try { return (Date.now() - fs.statSync(FINANCE_DB).mtimeMs) / 86400000; } catch { return Infinity; }
-}
-// Why the existing dataset needs rebuilding: tables from a newer app version are missing,
-// or a source was skipped (e.g. SEC_USER_AGENT missing) or failed on the last build.
-function rebuildReasons() {
-  try {
-    const { DatabaseSync } = require('node:sqlite');
-    const db = new DatabaseSync(FINANCE_DB, { readOnly: true });
-    const have = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name));
-    const missing = REQUIRED_TABLES.filter((t) => !have.has(t));
-    const bad = have.has('data_sources')
-      ? db.prepare("SELECT table_name, status FROM data_sources WHERE status IN ('skipped','error')").all().map((r) => `${r.table_name} (${r.status})`)
-      : [];
-    db.close();
-    return [...missing.map((t) => `new table ${t}`), ...bad];
-  } catch (e) { return [`unreadable dataset: ${e.message}`]; }
-}
-if (process.env.SKIP_DATA_LOAD !== '1') {
-  const reasons = finance.exists() ? rebuildReasons() : [];
-  if (!finance.exists()) refreshData('first run');
-  else if (reasons.length) refreshData(`rebuilding: ${reasons.join(', ')}`);
-  else if (dataAgeDays() > REFRESH_DAYS) refreshData('scheduled refresh');
-  else startSectorFill();
-  setInterval(() => { if (dataAgeDays() > REFRESH_DAYS) refreshData('scheduled refresh'); }, 6 * 3600 * 1000).unref();
-}
+const jobs = createJobs({ dataDir: DATA_DIR, log: (l) => console.log(l), onDataChanged });
+if (process.env.SKIP_DATA_LOAD !== '1') jobs.start();
 
 // ---------- helpers ----------
 const json = (res, status, body) => {
@@ -146,6 +103,32 @@ function preview(result) {
   return result.ok ? { columns: result.columns.map((c) => c.name), rows: result.rows, truncated: result.truncated, ms: result.ms } : { error: result.error };
 }
 
+// ---------- scans & monitors ----------
+async function runScans() {
+  if (scanCache.results && Date.now() - scanCache.at < 30 * 60 * 1000) return scanCache.results;
+  const tables = new Set(((finance.describe() || {}).tables || []).map((t) => t.name));
+  const results = [];
+  for (const sc of SCANS) {
+    if (sc.requires && !tables.has(sc.requires)) { results.push({ id: sc.id, unavailable: `Needs ${sc.requires} data, which isn't loaded yet.` }); continue; }
+    const r = await finance.run(sc.sql, { maxRows: 50 });
+    results.push(r.ok
+      ? { id: sc.id, count: r.rows.length, truncated: r.truncated, columns: r.columns.map((c) => c.name), rows: r.rows.slice(0, 5) }
+      : { id: sc.id, error: r.error });
+  }
+  scanCache.results = results; scanCache.at = Date.now();
+  return results;
+}
+
+const rowKey = (row) => JSON.stringify(row.slice(0, 2));
+async function runMonitor(m) {
+  const r = await finance.run(m.sql, { maxRows: 2000, timeoutMs: 15000 });
+  if (!r.ok) { store.recordMonitorRun(m.id, { error: r.error }); return; }
+  store.recordMonitorRun(m.id, { rowCount: r.rows.length, keys: [...new Set(r.rows.map(rowKey))] });
+}
+async function runAllMonitors() {
+  for (const m of store.allMonitors()) await runMonitor(m);
+}
+
 const csvCell = (v) => (v === null || v === undefined ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
 const toCsv = (cols, rows) => [cols.map(csvCell).join(','), ...rows.map((r) => r.map(csvCell).join(','))].join('\n');
 
@@ -198,7 +181,7 @@ async function handleGenerate(req, res, sid) {
     const version = store.addVersion(tx.id, {
       author: 'ai', actor: ai.model, prompt, sql: proposal.sql, summary: proposal.summary, title: base ? null : proposal.title,
       confidence: proposal.confidence, confidenceReason: proposal.confidenceReason, assumptions: proposal.assumptions,
-      clarifyingQuestion: proposal.clarifyingQuestion, checks,
+      clarifyingQuestion: proposal.clarifyingQuestion, checks, chart: proposal.chart,
       rowCount: result.ok ? result.rows.length : null, truncated: result.ok && result.truncated, runMs: result.ok ? result.ms : null,
       parentVersionId: base ? base.versionId : null,
     });
@@ -247,8 +230,8 @@ const server = http.createServer(async (req, res) => {
     let m;
     if (req.method === 'GET' && p === '/api/status') {
       return json(res, 200, {
-        dataReady: finance.exists(), dataLoading: loadState.loading, dataWarnings: loadState.errors.length,
-        sectors: loadState.sectors,
+        dataReady: finance.exists(), dataLoading: jobs.state.core.running, dataWarnings: jobs.state.core.warnings,
+        jobs: jobs.state,
         aiConfigured, mockAI: MOCK_AI, model: ai.model,
         limits: { perHour: MAX_PER_HOUR, perDay: MAX_PER_DAY, usedToday: store.dailyUsage() },
       });
@@ -281,7 +264,7 @@ const server = http.createServer(async (req, res) => {
       const latest = t.versions[t.versions.length - 1];
       const actor = actorName(req);
       const version = store.addVersion(t.id, {
-        author: 'user', actor, sql, summary: latest ? latest.summary : null, assumptions: [], checks: buildChecks(result),
+        author: 'user', actor, sql, summary: latest ? latest.summary : null, assumptions: [], checks: buildChecks(result), chart: latest ? latest.chart : null,
         rowCount: result.rows.length, truncated: result.truncated, runMs: result.ms, parentVersionId: latest ? latest.id : null,
         confidence: null,
       });
@@ -303,9 +286,9 @@ const server = http.createServer(async (req, res) => {
       store.audit(sid, {
         actor, actorType: 'user', event: decision, transformationId: v.transformation_id, versionId: v.id,
         detail: decision === 'accepted'
-          ? `v${v.number} (${v.author === 'ai' ? `AI-generated, ${v.confidence}% model-reported` : 'human-edited'}) approved for use${note ? ` — ${note}` : ''}`
+          ? `v${v.number} (${v.author === 'ai' ? `AI-generated, ${v.confidence}% model-reported` : v.author === 'system' ? 'predefined scan' : 'human-edited'}) approved for use${note ? ` — ${note}` : ''}`
           : `v${v.number} rejected${note ? ` — ${note}` : ''}`,
-        status: decision === 'accepted' ? (v.author === 'ai' ? 'verified' : 'modified') : 'rejected',
+        status: decision === 'accepted' ? (v.author === 'user' ? 'modified' : 'verified') : 'rejected',
       });
       return json(res, 200, store.getTransformation(sid, v.transformation_id));
     }
@@ -316,6 +299,63 @@ const server = http.createServer(async (req, res) => {
       if (!result.ok) return json(res, 400, { error: result.error });
       res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="transformation-v${v.number}.csv"` });
       return res.end(toCsv(result.columns.map((c) => c.name), result.rows));
+    }
+    if (req.method === 'GET' && p === '/api/scans') {
+      const results = Object.fromEntries((await runScans()).map((r) => [r.id, r]));
+      return json(res, 200, SCANS.map((sc) => ({ id: sc.id, title: sc.title, question: sc.question, why: sc.why, category: sc.category, ...results[sc.id] })));
+    }
+    if (req.method === 'POST' && (m = p.match(/^\/api\/scans\/([a-z_]+)\/open$/))) {
+      const sc = SCANS.find((x) => x.id === m[1]);
+      if (!sc) return json(res, 404, { error: 'Not found' });
+      const result = await finance.run(sc.sql, { maxRows: PREVIEW_ROWS });
+      const tx = store.createTransformation(sid, { title: sc.title, prompt: sc.question });
+      const version = store.addVersion(tx.id, {
+        author: 'system', actor: 'Nexus scan', prompt: sc.question, sql: sc.sql, summary: sc.why, assumptions: scanNotes(sc),
+        checks: buildChecks(result), chart: sc.chart || null, rowCount: result.ok ? result.rows.length : null,
+        truncated: result.ok && result.truncated, runMs: result.ok ? result.ms : null,
+      });
+      store.audit(sid, { actor: actorName(req), actorType: 'user', event: 'opened_scan', transformationId: tx.id, versionId: version.id, detail: `Opened the "${sc.title}" scan as v1 (predefined SQL, no AI)`, status: 'info' });
+      return json(res, 200, { transformation: store.getTransformation(sid, tx.id), version, preview: preview(result) });
+    }
+    if (req.method === 'POST' && (m = p.match(/^\/api\/versions\/(v_[a-f0-9]+)\/explain$/))) {
+      const v = store.getVersion(sid, m[1]);
+      if (!v) return json(res, 404, { error: 'Not found' });
+      const cached = store.getExplanation(v.id);
+      if (cached) return json(res, 200, cached);
+      if (!aiConfigured) return json(res, 503, { error: 'AI is not configured on this server.' });
+      const limited = rateCheck(sid);
+      if (limited) return json(res, 429, { error: limited });
+      const result = await finance.run(v.sql, { maxRows: PREVIEW_ROWS });
+      if (!result.ok) return json(res, 400, { error: `This version doesn't run: ${result.error}` });
+      if (!result.rows.length) return json(res, 400, { error: 'Nothing to explain — the query returns no rows.' });
+      store.bumpDailyUsage();
+      const t = store.getTransformation(sid, v.transformation_id);
+      const body = await ai.explain({ request: v.prompt || t.prompt, summary: v.summary, sql: v.sql, columns: result.columns.map((c) => c.name), rows: result.rows, truncated: result.truncated });
+      body.based_on_rows = result.rows.length;
+      body.model = ai.model;
+      store.saveExplanation(v.id, body);
+      store.audit(sid, { actor: 'ai-agent', actorType: 'ai', event: 'explained', transformationId: v.transformation_id, versionId: v.id, detail: `Summarized ${Math.min(result.rows.length, 60)} rows of v${v.number}: ${body.headline}`, status: 'ai_action' });
+      return json(res, 200, { ...store.getExplanation(v.id) });
+    }
+    if (req.method === 'GET' && p === '/api/monitors') return json(res, 200, store.listMonitors(sid));
+    if (req.method === 'POST' && (m = p.match(/^\/api\/transformations\/(tx_[a-f0-9]+)\/monitor$/))) {
+      const t = store.getTransformation(sid, m[1]);
+      if (!t) return json(res, 404, { error: 'Not found' });
+      const v = t.versions.find((x) => x.id === t.accepted_version_id);
+      if (!v) return json(res, 400, { error: 'Accept a version first — monitors only run approved SQL.' });
+      const mon = store.createMonitor(sid, { transformationId: t.id, versionId: v.id, name: t.title });
+      await runMonitor({ ...mon, sql: v.sql });
+      store.audit(sid, { actor: actorName(req), actorType: 'user', event: 'monitor_created', transformationId: t.id, versionId: v.id, detail: `Watching v${v.number}; re-runs whenever the data refreshes`, status: 'info' });
+      return json(res, 200, store.getMonitor(sid, mon.id));
+    }
+    if (req.method === 'POST' && (m = p.match(/^\/api\/monitors\/(mon_[a-f0-9]+)\/(run|seen)$/))) {
+      const mon = store.getMonitor(sid, m[1]);
+      if (!mon) return json(res, 404, { error: 'Not found' });
+      if (m[2] === 'run') await runMonitor(mon); else store.markMonitorSeen(sid, mon.id);
+      return json(res, 200, store.getMonitor(sid, mon.id));
+    }
+    if (req.method === 'DELETE' && (m = p.match(/^\/api\/monitors\/(mon_[a-f0-9]+)$/))) {
+      return store.deleteMonitor(sid, m[1]) ? json(res, 200, { ok: true }) : json(res, 404, { error: 'Not found' });
     }
     if (req.method === 'GET' && p === '/api/audit') return json(res, 200, store.listAudit(sid));
     if (req.method === 'GET' && p === '/api/audit.csv') {

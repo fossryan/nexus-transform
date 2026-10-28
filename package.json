@@ -7,8 +7,9 @@
   "engines": { "node": ">=22.13" },
   "scripts": {
     "start": "node --no-warnings server.js",
-    "load-data": "node --no-warnings lib/loader.js",
     "dev:mock": "node --no-warnings test/build-fixture-db.js && MOCK_AI=1 SKIP_DATA_LOAD=1 node --no-warnings server.js",
-    "test": "node test/smoke.js"
+    "fixtures": "node --no-warnings test/build-fixture-db.js",
+    "test": "node test/smoke.js",
+    "test:api": "node test/api-contract.js"
   }
 }

@@ -26,7 +26,7 @@ primary_region = 'ams'
   min_machines_running = 0
 
 [[vm]]
-  memory = '512mb'
+  # 1 GB: derived-table rebuilds and 13F parsing run alongside the web server.
+  memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 256

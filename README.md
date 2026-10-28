@@ -1,70 +1,80 @@
 # Nexus Transform
 
-Describe a financial data transformation in plain English. Claude drafts the SQL over **live public data** (SEC EDGAR filings, U.S. Treasury exchange rates, FRED rates), attaches every assumption to the SQL line it affects, and a human decides: **accept, edit or reject**. Every step is recorded in an audit log that labels AI actions separately from human ones.
+Describe a financial question in plain English. Claude drafts the SQL over **live public data**, attaches every assumption to the SQL line it affects, and a human decides: **accept, edit or reject**. Every step is recorded in an audit log that labels AI actions separately from human ones.
 
 This is the working version of the *AI Transformation Builder* case study on iamryanfoss.com.
 
-## What's real
+## What's in the data
 
-| Piece | How it works |
-|---|---|
-| Data | Pulled at first boot from SEC EDGAR (company list, annual and quarterly XBRL "frames", SIC sector codes), Treasury Fiscal Data (quarterly FX), and FRED (yields, fed funds, CPI, unemployment). Sector codes fill in the background after the main load, largest companies first. Refreshed weekly; an older dataset missing new tables is rebuilt automatically. Provenance is shown on the Data sources page. |
-| SQL generation | Claude via the Messages API, answering through a `propose_transformation` tool (offered with `tool_choice: auto`, since Sonnet 5.5 rejects forced tool use): SQL, plain-English summary, confidence, and `{line, note, severity}` assumptions. |
-| Self-repair | Every draft is compiled against the live schema. If SQLite rejects it, the error goes back to Claude once and the repair is logged. |
-| Confidence | Shown as **model-reported**, next to **system checks** the server computes independently (parses against schema, row count, columns that are mostly null, truncation). |
-| Safety | Only single `SELECT`/`WITH` statements; the finance DB is opened read-only in a worker thread that is killed after 4 seconds. |
-| Versions & diff | AI drafts, human edits and AI revisions are numbered versions with a line diff between any two. |
-| Audit log | Requested, generated, repaired, edited, accepted, rejected, blocked — with actor and status. Exportable as CSV. Scoped to each browser session. |
+| Area | Tables | Source | Refresh |
+|---|---|---|---|
+| Fundamentals | `annual_financials` (27 metrics: income, cash flow, balance sheet, shares, EPS), `quarterly_financials` | SEC EDGAR XBRL frames | Weekly |
+| Ratios & peer ranks | `company_ratios` — margins, growth, FCF, coverage, leverage, ROE, dilution, cash runway, percentile vs industry and sector | Derived | After each load |
+| Scores | `company_scores` — Piotroski F, Altman Z″, Beneish M with every component | Derived | After each load |
+| Sectors | `company_profiles` — SIC industry, sector, fiscal year-end | SEC submissions | Background fill, then weekly |
+| Red-flag events | `filing_events` — 8-K items (restatements, auditor changes, impairments, bankruptcy…) | SEC submissions | With profiles |
+| Insider trading | `insider_trades` — open-market buys/sells, last 8 quarters | SEC Insider Transactions Data Sets (Form 4) | Daily check for new quarters |
+| Fund holdings | `fund_holdings`, `fund_position_changes` — top ~150 managers, last 2 periods | SEC Form 13F Data Sets | Daily check |
+| Prices & valuation | `prices`, `price_history`, `valuation` (market cap, P/E, EV/EBIT, FCF yield, returns) | Finnhub (your key) | Daily, largest ~1,000 companies |
+| Macro | `econ_observations` — yields, fed funds, CPI, unemployment, credit spreads, breakevens, VIX, oil, dollar, GDP, mortgages | FRED | Weekly |
+| FX | `fx_rates` | U.S. Treasury | Weekly |
 
-No dependencies: Node 22's built-in `node:sqlite`, `http`, `fetch` and `worker_threads`.
+Every company-level row carries a `filing_url` back to its SEC filing. If a refresh comes back much smaller than the data it would replace (a source was down), the previous data is kept.
 
-## Run locally
+## Features
+
+- **Builder** — plain English → SQL with line-level assumptions, model-reported confidence next to independent system checks, self-repair, versions, diff, accept/edit/reject.
+- **Charts** — line charts for time series, bar charts for rankings; the AI suggests one, with a fallback that picks from the columns.
+- **Explain results** — an AI read of what stands out in the rows, with caveats. Cached per version so re-opening is free.
+- **Insights** — 11 predefined scans (margin collapse, cash runway, debt surge, Beneish flags, Altman distress, Piotroski 8–9, insider cluster buying, red-flag 8-Ks, dilution, new fund positions, quality at a reasonable price). Plain SQL, no AI cost; open any as a reviewable transformation.
+- **Monitors** — watch an accepted transformation; it re-runs when data refreshes and flags new rows.
+- **Audit log** — requested, generated, repaired, edited, accepted, rejected, explained, scans opened, monitors created. CSV export.
+
+No dependencies: Node 22's built-in `node:sqlite`, `http`, `fetch`, `zlib` and `worker_threads`.
+
+## Deploy (Fly.io)
 
 ```bash
-# Offline, with placeholder data and a mock AI (for UI work)
-npm run dev:mock            # http://localhost:8080
-
-# Real data + real Claude
-export ANTHROPIC_API_KEY=sk-ant-...
-export SEC_USER_AGENT="Your Name your@email.com"   # SEC requires a contact in the User-Agent
-npm run load-data           # ~3–5 min, writes data/finance.db
-npm start
+fly volumes list -a nexus-transform                                 # note the volume id
+fly volumes extend <volume-id> --size 3 -a nexus-transform          # full dataset needs ~1–1.5 GB plus room to rebuild
+fly secrets set ANTHROPIC_API_KEY=sk-ant-... SEC_USER_AGENT="Your Name your@email.com" FINNHUB_API_KEY=... -a nexus-transform
+fly deploy -a nexus-transform
 ```
 
-## Deploy to Fly.io
-
-```bash
-fly launch --no-deploy                       # keep the existing fly.toml; pick an app name
-fly volumes create nexus_data --size 1 --region bos
-fly secrets set ANTHROPIC_API_KEY=sk-ant-... SEC_USER_AGENT="Your Name your@email.com"
-fly deploy
-```
-
-The first boot builds the dataset in the background (a banner shows progress). Later boots reuse it from the volume.
+First boot: core data ~10–15 min, then sectors/8-K events (~15 min), insider + 13F files, and prices (~35 min) fill in the background. Banners show progress; everything already loaded is usable meanwhile.
 
 ## Settings (env vars)
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Required for generation |
-| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Model used for SQL generation |
-| `SEC_USER_AGENT` | — | Required for EDGAR tables |
-| `MAX_GENERATIONS_PER_HOUR` | 25 | Per browser session |
-| `MAX_DAILY_GENERATIONS` | 400 | Whole server — caps your API spend |
-| `DATA_REFRESH_DAYS` | 7 | Rebuild data when older than this |
+| `ANTHROPIC_API_KEY` | — | Required for generation and explanations |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Model used |
+| `SEC_USER_AGENT` | — | Required for all SEC data (SEC asks for a name and contact email) |
+| `FINNHUB_API_KEY` | — | Enables prices and the `valuation` view. Check Finnhub's terms for public display |
+| `FINNHUB_MAX_COMPANIES` | 1000 | How many of the largest companies get prices |
+| `MAX_GENERATIONS_PER_HOUR` | 25 | Per browser session (generations + explanations) |
+| `MAX_DAILY_GENERATIONS` | 400 | Whole server — caps API spend |
+| `DATA_REFRESH_DAYS` | 7 | Rebuild core data when older than this |
+| `QUERY_TIMEOUT_MS` | 8000 | Per-query time limit |
 
 ## Known limits
 
-- `financials` uses SEC calendar-year frames, not fiscal years. The AI is told this and should flag it.
-- Companies that report revenue under a less common XBRL tag will show `NULL` revenue.
-- Treasury rates are quarterly, so this is not a daily FX source.
-- Quarterly Q4 income figures are often missing (companies report the full year in the 10-K); derive Q4 as annual minus Q1–Q3.
-- Sectors use SEC SIC codes, which are older and coarser than GICS.
+- Fundamentals use SEC calendar-year frames, not fiscal years (`fiscal_year_end` lets you check).
+- Companies that use uncommon XBRL tags show `NULL` for that metric.
+- Q4 income figures are often missing in quarterly data; derive as annual minus Q1–Q3.
+- Sectors use SEC SIC codes (older and coarser than GICS).
+- 13F lists issuer names and CUSIPs, not tickers; matching to companies is by name.
+- Altman and Beneish don't apply to banks and insurers and are left `NULL` for SIC 6000–6799.
+- Price history starts the day prices are enabled and grows daily.
 
 ## Tests
 
 ```bash
-node test/build-fixture-db.js
-MOCK_AI=1 SKIP_DATA_LOAD=1 PORT=8099 node --no-warnings server.js &
-BASE=http://localhost:8099 npm test
+npm run fixtures                                   # builds every database from placeholder fixtures
+MOCK_AI=1 SKIP_DATA_LOAD=1 PORT=8099 npm start &
+BASE=http://localhost:8099 npm test                # end-to-end API test
+
+node test/fake-anthropic.js 8111 &                 # stand-in API enforcing Sonnet 5.5 rules
+ANTHROPIC_API_KEY=test ANTHROPIC_BASE_URL=http://localhost:8111 SKIP_DATA_LOAD=1 PORT=8098 npm start &
+BASE=http://localhost:8098 FAKE=http://localhost:8111 npm run test:api
 ```

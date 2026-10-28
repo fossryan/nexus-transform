@@ -7,11 +7,13 @@ const view = $('#view');
 
 const EXAMPLES = [
   'Which large companies kept operating margins steady through the 2022–23 rate hikes? Compare 2021 vs 2023 margins, revenue over $1B',
+  'Companies with a Piotroski score of 8+ in the Altman safe zone, revenue over $1B, ranked by free-cash-flow margin',
   'Real revenue growth 2021→2024: adjust revenue for CPI inflation and rank the top 20 real growers with revenue over $1B',
+  'Software companies in the top 10% of their industry for both revenue growth and operating margin',
+  'Insider buying in the last 6 months at companies whose operating margin improved last year',
   'Estimate 2023 interest income on cash: cash × that year\'s average fed funds rate, top 15 companies',
-  'Median net margin and revenue growth by sector, 2024 vs 2023',
   'Quarterly revenue since 2023 for the 10 largest software companies',
-  'How long was the 10-year/2-year Treasury yield curve inverted, and how deep did it get?',
+  'Credit spread (Baa minus 10-year) vs VIX by month since 2020',
 ];
 
 const state = {
@@ -137,22 +139,28 @@ async function loadStatus() {
   const b = [];
   if (s.mockAI) b.push(['warn', '<b>Mock AI mode.</b> Responses are canned test fixtures, not Claude. Set ANTHROPIC_API_KEY and remove MOCK_AI to go live.']);
   else if (!s.aiConfigured) b.push(['err', '<b>AI generation is off.</b> This server has no ANTHROPIC_API_KEY. You can still browse data and run your own SQL.']);
-  if (s.dataReady && !s.dataLoading && s.sectors && s.sectors.running && s.sectors.total) {
-    b.push(['info', `Adding SEC sector codes in the background: ${s.sectors.done.toLocaleString()} of ${s.sectors.total.toLocaleString()} companies, largest first. Sector questions work for the companies done so far.`]);
-  }
+  const j = s.jobs || {};
+  const bg = [];
+  if (j.profiles && j.profiles.running && j.profiles.total) bg.push(`company sectors and 8-K events: ${j.profiles.done.toLocaleString()} of ${j.profiles.total.toLocaleString()} companies`);
+  if (j.ownership && j.ownership.running) bg.push('insider trades and fund holdings');
+  if (j.prices && j.prices.running && j.prices.total) bg.push(`stock prices: ${j.prices.done.toLocaleString()} of ${j.prices.total.toLocaleString()}`);
+  if (s.dataReady && !s.dataLoading && bg.length) b.push(['info', `Loading in the background — ${bg.join('; ')}. Everything already loaded works now.`]);
   if (!s.dataReady) b.push(['info', '<b>Loading the latest SEC, Treasury and FRED data…</b> The first start takes a few minutes. This page will update by itself.']);
   else if (s.dataLoading) b.push(['info', 'Refreshing the dataset in the background. Queries keep working on the current copy.']);
   $('#banners').innerHTML = b.map(([k, h]) => `<div class="banner ${k}">${h}</div>`).join('');
   $('#modelLine').textContent = s.mockAI ? 'AI · mock fixtures' : s.aiConfigured ? `AI · ${s.model}` : 'AI · not configured';
-  $('#dataLine').textContent = s.dataReady ? 'Data · SEC · Treasury · FRED' : 'Data · loading…';
+  $('#dataLine').textContent = s.dataReady ? `Data · SEC · Treasury · FRED${j.prices && j.prices.configured ? ' · Finnhub' : ''}` : 'Data · loading…';
   if (!s.dataReady || s.dataLoading) setTimeout(loadStatus, 5000);
-  else if (s.sectors && s.sectors.running) setTimeout(loadStatus, 30000);
+  else if (bg.length) setTimeout(loadStatus, 30000);
 }
 
 async function refreshCounts() {
   try {
-    const [list, audit] = await Promise.all([api('GET', '/api/transformations'), api('GET', '/api/audit')]);
+    const [list, audit, mons] = await Promise.all([api('GET', '/api/transformations'), api('GET', '/api/audit'), api('GET', '/api/monitors')]);
     $('#navTxCount').textContent = list.length || '';
+    const fresh = mons.reduce((n, m) => n + (m.new_rows || 0), 0);
+    $('#navMonCount').textContent = fresh ? `${fresh} new` : (mons.length || '');
+    $('#navMonCount').classList.toggle('hot', fresh > 0);
     const review = audit.filter((a) => a.status === 'ai_action').length;
     $('#navAuditCount').textContent = audit.length || '';
     return { list, audit, review };
@@ -173,6 +181,8 @@ async function route() {
   } else if (page === 'transformations') renderList();
   else if (page === 'audit') renderAudit();
   else if (page === 'data') renderData();
+  else if (page === 'scans') renderScans();
+  else if (page === 'monitors') renderMonitors();
   else renderBuilder();
   window.scrollTo({ top: 0 });
 }
@@ -339,11 +349,14 @@ function workPanel(v) {
   const t = state.tx;
   const p = state.preview;
   const rowsLabel = p && p.rows ? (p.truncated ? '500+' : p.rows.length) : '';
-  const tabs = [['sql', 'SQL', ''], ['results', 'Results', rowsLabel], ['history', 'Versions', t.versions.length], ['diff', 'Diff', '']];
+  const spec = p && p.rows ? chartSpec(v, p) : null;
+  const tabs = [['sql', 'SQL', ''], ['results', 'Results', rowsLabel], ...(spec ? [['chart', 'Chart', '']] : []), ['history', 'Versions', t.versions.length], ['diff', 'Diff', '']];
+  if (state.tab === 'chart' && !spec) state.tab = 'results';
   let body = '';
   if (state.editing) body = editorView();
   else if (state.tab === 'sql') body = sqlView(v);
   else if (state.tab === 'results') body = resultsView();
+  else if (state.tab === 'chart') body = chartView(spec, p);
   else if (state.tab === 'history') body = historyView();
   else if (state.tab === 'diff') body = diffView();
   const right = state.tab === 'sql' && !state.editing && v.assumptions.length
@@ -372,11 +385,13 @@ function sqlView(v) {
     return `<div class="ln ${top ? `flag-${top.severity}` : ''}" id="L${n}">
         <span class="g">${top ? `<button class="marker ${top.severity}" data-jump="${n}" title="${esc(top.note)}" aria-label="Note on line ${n}"></button>` : ''}</span>
         <span class="n">${n}</span><span class="t">${highlight(ln) || ' '}</span>
-      </div>${notes.map((a) => `<div class="note ${a.severity}"><span class="who-tag">${a.severity === 'info' ? 'AI note' : a.severity}</span><span>${esc(a.note)}</span></div>`).join('')}`;
+      </div>${notes.map((a) => `<div class="note ${a.severity}"><span class="who-tag">${a.severity === 'info' ? (v.author === 'system' ? 'Note' : 'AI note') : a.severity}</span><span>${esc(a.note)}</span></div>`).join('')}`;
   }).join('');
   const header = v.author === 'ai'
     ? `<span class="chip ai">AI-generated</span><span class="micro">v${v.number} · ${esc(v.actor)} · ${ago(v.created_at)}</span>`
-    : `<span class="chip user">Edited by ${esc(v.actor)}</span><span class="micro">v${v.number} · ${ago(v.created_at)} · not AI-reviewed</span>`;
+    : v.author === 'system'
+      ? `<span class="chip system">Predefined scan</span><span class="micro">v${v.number} · no AI involved · ${ago(v.created_at)}</span>`
+      : `<span class="chip user">Edited by ${esc(v.actor)}</span><span class="micro">v${v.number} · ${ago(v.created_at)} · not AI-reviewed</span>`;
   return `<div class="panel-h" style="justify-content:flex-start;gap:10px;border-bottom:0;padding-bottom:0">${header}</div>
     <div class="code ${state.showNotes ? '' : 'notes-hidden'}">${html}</div>`;
 }
@@ -392,9 +407,10 @@ function resultsView() {
   const body = p.rows.map((r) => `<tr>${r.map((val, i) => {
     if (val === null) return '<td class="null">null</td>';
     if (kinds[i].numeric && typeof val === 'number') return `<td class="n ${val < 0 ? 'neg' : ''}" title="${esc(val)}">${esc(fmtNum(val, kinds[i]))}</td>`;
+    if (typeof val === 'string' && /^https:\/\/www\.sec\.gov\//.test(val)) return `<td><a href="${esc(val)}" target="_blank" rel="noopener">Filing ↗</a></td>`;
     return `<td>${esc(val)}</td>`;
   }).join('')}</tr>`).join('');
-  return `<div class="tablewrap"><table class="data"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
+  return `${explainBox(v)}<div class="tablewrap"><table class="data"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
     <div class="table-foot"><span>${p.truncated ? 'First 500 rows' : `${p.rows.length.toLocaleString()} rows`} · ${p.ms} ms · values in source units (USD for financials)</span>
     <a class="btn sm" href="/api/versions/${v.id}/export.csv" download>Download CSV</a></div>`;
 }
@@ -405,8 +421,8 @@ function historyView() {
     return `<li data-version="${v.id}" class="${v.id === state.versionId ? 'current' : ''}">
       <span class="vnum">v${v.number}</span>
       <div class="vmeta">
-        <div>${v.author === 'ai' ? `<span class="chip ai">AI</span> ${esc(v.actor)}` : `<span class="chip user">Human</span> ${esc(v.actor)}`} · ${fmtTime(v.created_at)}</div>
-        <div class="p">${esc(v.author === 'ai' ? `“${v.prompt}”` : 'Manual SQL edit')}${v.decision_note ? ` — ${esc(v.decision_note)}` : ''}</div>
+        <div>${v.author === 'ai' ? `<span class="chip ai">AI</span> ${esc(v.actor)}` : v.author === 'system' ? '<span class="chip system">Scan</span> Nexus' : `<span class="chip user">Human</span> ${esc(v.actor)}`} · ${fmtTime(v.created_at)}</div>
+        <div class="p">${esc(v.author === 'user' ? 'Manual SQL edit' : `“${v.prompt}”`)}${v.decision_note ? ` — ${esc(v.decision_note)}` : ''}</div>
       </div>
       <div class="vright">${v.confidence !== null ? `<span class="mono muted">${v.confidence}%</span>` : ''}<span class="chip ${dec}">${dec.replace('_', ' ')}</span></div>
     </li>`;
@@ -451,7 +467,7 @@ function rail(v) {
   const counts = v.assumptions.reduce((m, a) => (m[a.severity] = (m[a.severity] || 0) + 1, m), {});
   const conf = v.confidence;
   const confPanel = conf === null
-    ? `<div class="panel"><h4>Confidence</h4><p class="conf-reason">Human-edited SQL has no AI confidence score. The system checks below still apply.</p></div>`
+    ? `<div class="panel"><h4>Confidence</h4><p class="conf-reason">${v.author === 'system' ? 'Predefined scan written by hand — no AI confidence score. Read the notes on the SQL; the system checks below still apply.' : 'Human-edited SQL has no AI confidence score. The system checks below still apply.'}</p></div>`
     : `<div class="panel">
         <div class="conf-top"><h4 style="margin:0">Confidence</h4><span class="conf-src">model-reported</span></div>
         <div class="conf-top" style="margin-top:6px"><span class="conf-num num">${conf}<small style="font-size:16px">%</small></span>
@@ -466,7 +482,8 @@ function rail(v) {
       <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><button class="btn sm" data-version="${latestVersion().id}">Go to latest</button><button class="btn sm edit" id="restoreBtn">Restore as v${state.tx.versions.length + 1}</button></div></div>`;
   } else if (v.decision === 'accepted') {
     decide = `<div class="panel"><h4>Decision</h4><span class="chip accepted">✓ Accepted</span><p class="decision-note">v${v.number} is the approved version${v.decision_note ? ` — “${esc(v.decision_note)}”` : ''}. Revise or edit to create a new version for review.</p>
-      <div style="margin-top:10px"><button class="btn sm edit" id="editBtn">✎ Edit SQL</button></div></div>`;
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm edit" id="editBtn">✎ Edit SQL</button><button class="btn sm" id="watchBtn">◉ Watch for changes</button></div>
+      <p class="decision-note muted" style="font-size:12px">Watching re-runs this approved SQL whenever the data refreshes and flags new rows.</p></div>`;
   } else if (v.decision === 'rejected') {
     decide = `<div class="panel"><h4>Decision</h4><span class="chip rejected">✕ Rejected</span><p class="decision-note">${v.decision_note ? `“${esc(v.decision_note)}”` : 'No reason given.'} Ask the AI for a revision above, or fix it by hand.</p>
       <div style="margin-top:10px"><button class="btn sm edit" id="editBtn">✎ Edit SQL</button></div></div>`;
@@ -508,6 +525,10 @@ function bindReview(v) {
   $('#rejectBtn')?.addEventListener('click', () => openReject(v));
   $('#editBtn')?.addEventListener('click', () => startEdit(v.sql));
   $('#restoreBtn')?.addEventListener('click', () => startEdit(v.sql));
+  $('#watchBtn')?.addEventListener('click', async () => {
+    try { await api('POST', `/api/transformations/${state.tx.id}/monitor`); toast('Watching — see Monitors'); refreshCounts(); } catch (e) { toast(e.message); }
+  });
+  $('#explainBtn')?.addEventListener('click', () => explain(v));
   $('#answerQ')?.addEventListener('click', () => { const ta = $('#promptInput'); ta.focus(); ta.scrollIntoView({ block: 'center' }); });
   if (state.editing) {
     const ta = $('#editSql');
@@ -581,7 +602,7 @@ async function renderList() {
 const EVENT_LABEL = {
   requested: 'Requested transformation', requested_revision: 'Requested revision', generated: 'Generated SQL', repaired: 'Self-corrected SQL',
   edited: 'Edited SQL by hand', accepted: 'Accepted', rejected: 'Rejected', run_failed: 'Edit failed to run', blocked: 'Blocked unsafe SQL',
-  generation_failed: 'Generation failed',
+  generation_failed: 'Generation failed', opened_scan: 'Opened a scan', explained: 'Explained results', monitor_created: 'Started watching',
 };
 async function renderAudit() {
   view.innerHTML = `<div class="page-head"><div><div class="crumb">Governance</div><h1>Audit <em>log</em></h1></div>
@@ -623,6 +644,187 @@ async function renderData() {
       ${t.source && t.source.notes && t.source.status !== 'ok' ? `<div class="banner warn" style="margin:0">${esc(t.source.notes)}</div>` : ''}
       <details><summary>${t.columns.length} columns</summary><ul class="cols">${t.columns.map((c) => `<li><code>${esc(c.name)}</code> <span>${esc(c.type)}${c.note ? ` — ${esc(c.note)}` : ''}</span></li>`).join('')}</ul></details>
     </div>`).join('');
+}
+
+// ---------- charts ----------
+const PALETTE = ['var(--cyan)', 'var(--purple)', 'var(--amber)', 'var(--green)', 'var(--red)', '#7cc7ff'];
+const TIMEISH = /^(date|month|year|calendar_year|quarter|period|obs_date|record_date|trans_date|filing_date|as_of|report_period|yq|year_quarter)$|_date$|_month$|_year$/i;
+
+// Use the AI's chart suggestion when it matches the result; otherwise guess from the columns.
+function chartSpec(v, p) {
+  if (!p || !p.rows || p.rows.length < 2) return null;
+  const kinds = colKinds(p.columns, p.rows);
+  const idx = (name) => p.columns.indexOf(name);
+  const numericCols = p.columns.filter((c, i) => kinds[i].numeric && !kinds[i].plain);
+  const c = v && v.chart;
+  if (c && idx(c.x) >= 0) {
+    const y = c.y.filter((n) => idx(n) >= 0 && kinds[idx(n)].numeric);
+    if (y.length) return { type: c.type, x: c.x, y, series: c.series && idx(c.series) >= 0 ? c.series : null, source: 'ai' };
+  }
+  const x = p.columns.find((col) => TIMEISH.test(col));
+  if (x && numericCols.filter((n) => n !== x).length) {
+    const textCols = p.columns.filter((col, i) => !kinds[i].numeric && col !== x);
+    const series = textCols.find((col) => /ticker|name|series|currency|sector/i.test(col)) || null;
+    return { type: 'line', x, y: numericCols.filter((n) => n !== x).slice(0, series ? 1 : 3), series, source: 'auto' };
+  }
+  const label = p.columns.find((col, i) => !kinds[i].numeric);
+  if (label && numericCols.length && p.rows.length <= 40) return { type: 'bar', x: label, y: [numericCols[0]], series: null, source: 'auto' };
+  return null;
+}
+
+const shortNum = (v) => {
+  const a = Math.abs(v);
+  if (a >= 1e12) return `${(v / 1e12).toFixed(1)}T`;
+  if (a >= 1e9) return `${(v / 1e9).toFixed(1)}B`;
+  if (a >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return Number.isInteger(v) ? String(v) : v.toFixed(Math.abs(v) < 1 ? 3 : 2);
+};
+function niceTicks(lo, hi, n = 5) {
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const step0 = (hi - lo) / n;
+  const mag = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= step0);
+  const start = Math.floor(lo / step) * step;
+  const out = [];
+  for (let t = start; t <= hi + step * 0.5; t += step) out.push(+t.toFixed(10));
+  return out;
+}
+
+function chartView(spec, p) {
+  if (!spec) return '<div class="empty">No chart for this result.</div>';
+  const xi = p.columns.indexOf(spec.x);
+  const legendNote = spec.source === 'ai' ? 'Chart suggested by the AI' : 'Chart picked automatically from the columns';
+  if (spec.type === 'bar') return barChart(spec, p, xi, legendNote);
+  // Build series: either one per y column, or one per value of the series column.
+  let series = [];
+  if (spec.series) {
+    const si = p.columns.indexOf(spec.series); const yi = p.columns.indexOf(spec.y[0]);
+    const groups = new Map();
+    for (const r of p.rows) { const k = String(r[si]); if (!groups.has(k)) groups.set(k, []); groups.get(k).push([r[xi], r[yi]]); }
+    series = [...groups.entries()].slice(0, 6).map(([name, pts]) => ({ name, pts }));
+  } else {
+    series = spec.y.map((name) => ({ name, pts: p.rows.map((r) => [r[xi], r[p.columns.indexOf(name)]]) }));
+  }
+  const xs = [...new Set(series.flatMap((sr) => sr.pts.map((pt) => String(pt[0]))))].sort();
+  const vals = series.flatMap((sr) => sr.pts.map((pt) => pt[1])).filter((v) => typeof v === 'number');
+  if (!vals.length || xs.length < 2) return '<div class="empty">Not enough points to chart.</div>';
+  const W = 720; const H = 300; const L = 58; const R = 14; const T = 14; const B = 34;
+  const ticks = niceTicks(Math.min(0, ...vals) < 0 ? Math.min(...vals) : Math.min(...vals), Math.max(...vals));
+  const lo = ticks[0]; const hi = ticks.at(-1);
+  const X = (i) => L + (i * (W - L - R)) / (xs.length - 1);
+  const Y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo || 1));
+  const grid = ticks.map((t) => `<line x1="${L}" x2="${W - R}" y1="${Y(t)}" y2="${Y(t)}" class="gl${t === 0 ? ' zero' : ''}"/><text x="${L - 8}" y="${Y(t) + 4}" text-anchor="end" class="ax">${shortNum(t)}</text>`).join('');
+  const every = Math.max(1, Math.ceil(xs.length / 7));
+  const xl = xs.map((x, i) => (i % every === 0 || i === xs.length - 1 ? `<text x="${X(i)}" y="${H - 12}" text-anchor="${i === 0 ? 'start' : i === xs.length - 1 ? 'end' : 'middle'}" class="ax">${esc(x.length > 10 ? x.slice(0, 10) : x)}</text>` : '')).join('');
+  const lines = series.map((sr, k) => {
+    const pts = sr.pts.filter((pt) => typeof pt[1] === 'number').map((pt) => [xs.indexOf(String(pt[0])), pt[1]]).sort((a, b) => a[0] - b[0]);
+    const d = pts.map(([i, v], j) => `${j ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join('');
+    return `<path d="${d}" fill="none" stroke="${PALETTE[k % PALETTE.length]}" stroke-width="2" stroke-linejoin="round"/>${pts.length <= 40 ? pts.map(([i, v]) => `<circle cx="${X(i)}" cy="${Y(v)}" r="2.5" fill="${PALETTE[k % PALETTE.length]}"><title>${esc(sr.name)} · ${esc(xs[i])}: ${esc(fmtNum(v, { plain: false }))}</title></circle>`).join('') : ''}`;
+  }).join('');
+  const legend = series.map((sr, k) => `<span><i style="background:${PALETTE[k % PALETTE.length]}"></i>${esc(sr.name)}</span>`).join('');
+  return `<div class="chart"><div class="chart-legend">${legend}</div>
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Line chart of ${esc(spec.y.join(', '))} by ${esc(spec.x)}">${grid}${xl}${lines}</svg>
+    <div class="table-foot"><span>${legendNote} · ${esc(spec.y.join(', '))} by ${esc(spec.x)}${p.truncated ? ' · first 500 rows' : ''}</span></div></div>`;
+}
+
+function barChart(spec, p, xi, legendNote) {
+  const yi = p.columns.indexOf(spec.y[0]);
+  const rows = p.rows.filter((r) => typeof r[yi] === 'number').slice(0, 25);
+  if (!rows.length) return '<div class="empty">Nothing numeric to chart.</div>';
+  const vals = rows.map((r) => r[yi]);
+  const lo = Math.min(0, ...vals); const hi = Math.max(0, ...vals);
+  const span = hi - lo || 1;
+  const zero = ((0 - lo) / span) * 100;
+  const bars = rows.map((r) => {
+    const v = r[yi];
+    const w = (Math.abs(v) / span) * 100;
+    const left = v >= 0 ? zero : zero - w;
+    return `<div class="hb"><span class="hb-l" title="${esc(r[xi])}">${esc(String(r[xi]).slice(0, 28))}</span>
+      <span class="hb-track"><i class="${v < 0 ? 'neg' : ''}" style="left:${left}%;width:${Math.max(w, 0.5)}%"></i></span>
+      <span class="hb-v num">${esc(fmtNum(v, { plain: false }))}</span></div>`;
+  }).join('');
+  return `<div class="chart"><div class="chart-legend"><span><i style="background:var(--cyan)"></i>${esc(spec.y[0])}</span></div>
+    <div class="hbars">${bars}</div>
+    <div class="table-foot"><span>${legendNote}${p.rows.length > 25 ? ' · top 25 rows' : ''}</span></div></div>`;
+}
+
+// ---------- AI explanation of results ----------
+state.explanations = {};
+function explainBox(v) {
+  const e = state.explanations[v.id];
+  if (e && e.loading) return '<div class="explain"><div class="step active"><span class="dot"></span>Reading the results…</div></div>';
+  if (e && e.error) return `<div class="explain"><p class="muted" style="margin:0">${esc(e.error)}</p></div>`;
+  if (e && e.headline) {
+    return `<div class="explain">
+      <div class="explain-h"><span class="chip ai">AI read</span><span class="micro">${e.based_on_rows ? `based on ${Math.min(e.based_on_rows, 60)} of ${e.based_on_rows} rows` : ''} · ${esc(e.model || '')}</span></div>
+      <p class="explain-head">${esc(e.headline)}</p>
+      <ul>${e.findings.map((f) => `<li>${esc(f.text)}</li>`).join('')}</ul>
+      ${e.caveats.length ? `<p class="explain-cav"><b>Caveats:</b> ${e.caveats.map(esc).join(' ')}</p>` : ''}
+    </div>`;
+  }
+  const can = state.status && state.status.aiConfigured;
+  return `<div class="explain-cta"><span class="muted">What stands out in these rows?</span><button class="btn sm edit" id="explainBtn" ${can ? '' : 'disabled title="AI is not configured"'}>✦ Explain results</button></div>`;
+}
+async function explain(v) {
+  state.explanations[v.id] = { loading: true }; renderReviewOnly();
+  try { state.explanations[v.id] = await api('POST', `/api/versions/${v.id}/explain`); refreshCounts(); }
+  catch (e) { state.explanations[v.id] = { error: e.message }; }
+  renderReviewOnly();
+}
+
+// ---------- insights (predefined scans) ----------
+async function renderScans() {
+  view.innerHTML = `<div class="page-head"><div><div class="crumb">Insights</div><h1>Scans that find <em>signals</em></h1></div></div>
+    <p class="intro" style="font-size:13.5px">Ready-made screens over every company in the dataset — forensic scores, cash burn, debt surges, red-flag filings, insider buying and fund flows. They are plain SQL with no AI, so they're free to run. Open one to review the SQL and notes, accept it, explain it, or watch it for changes.</p>
+    <div id="scanMount" class="scans"><div class="empty">Running scans…</div></div>`;
+  let scans;
+  try { scans = await api('GET', '/api/scans'); } catch (e) { $('#scanMount').innerHTML = `<div class="panel empty">${esc(e.message)}</div>`; return; }
+  const card = (sc) => {
+    const status = sc.unavailable ? `<span class="chip info">Not loaded</span>` : sc.error ? `<span class="chip error">Error</span>` : `<span class="chip ${sc.count ? (sc.category === 'risk' ? 'warn' : 'ok') : 'info'}">${sc.count}${sc.truncated ? '+' : ''} match${sc.count === 1 ? '' : 'es'}</span>`;
+    const preview = sc.rows && sc.rows.length ? `<table class="data mini"><tbody>${sc.rows.slice(0, 3).map((r) => `<tr>${r.slice(0, 3).map((v) => `<td class="${typeof v === 'number' ? 'n' : ''}">${esc(typeof v === 'number' ? fmtNum(v, { plain: false }) : v)}</td>`).join('')}</tr>`).join('')}</tbody></table>` : '';
+    return `<div class="panel scan ${sc.category}">
+      <div class="scan-top"><span class="micro">${sc.category === 'risk' ? '▲ Risk' : '◆ Opportunity'}</span>${status}</div>
+      <h3>${esc(sc.title)}</h3>
+      <p class="q">${esc(sc.question)}</p>
+      <p class="why">${esc(sc.why)}</p>
+      ${sc.unavailable ? `<p class="why">${esc(sc.unavailable)}</p>` : ''}${sc.error ? `<p class="why">${esc(sc.error)}</p>` : ''}
+      ${preview}
+      <div><button class="btn sm ${sc.unavailable ? '' : 'primary'}" data-open-scan="${sc.id}" ${sc.unavailable ? 'disabled' : ''}>Open in builder →</button></div>
+    </div>`;
+  };
+  $('#scanMount').innerHTML = scans.map(card).join('');
+  view.querySelectorAll('[data-open-scan]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      const r = await api('POST', `/api/scans/${b.dataset.openScan}/open`);
+      state.tx = r.transformation; state.versionId = r.version.id; state.preview = r.preview; state.previewFor = r.version.id; state.tab = 'results';
+      location.hash = `#/builder/${r.transformation.id}`; refreshCounts();
+    } catch (e) { toast(e.message); b.disabled = false; }
+  }));
+}
+
+// ---------- monitors ----------
+async function renderMonitors() {
+  view.innerHTML = `<div class="page-head"><div><div class="crumb">Watchlist</div><h1>Monitors</h1></div></div>
+    <p class="intro" style="font-size:13.5px">Approved transformations you're watching. Each re-runs automatically whenever the data refreshes (filings weekly, insider and fund data as SEC publishes, prices daily). <b>New rows</b> are results that weren't there last time — a new company entering a screen, a new red-flag filing.</p>
+    <div class="panel" id="monMount"><div class="empty">Loading…</div></div>`;
+  const mons = await api('GET', '/api/monitors').catch(() => []);
+  const mount = $('#monMount');
+  if (!mons.length) { mount.innerHTML = '<div class="empty"><h3>Nothing watched yet</h3><p>Accept a transformation or a scan, then choose “Watch for changes”.</p><a class="btn primary" href="#/scans">Browse scans</a></div>'; return; }
+  mount.innerHTML = `<div class="tablewrap" style="max-height:none"><table class="data"><thead><tr><th>Monitor</th><th class="n">Rows</th><th>New since last run</th><th>Last run</th><th></th></tr></thead><tbody>
+    ${mons.map((m) => `<tr>
+      <td><a href="#/builder/${m.transformation_id}">${esc(m.name)}</a> <span class="mono muted">v${m.version_number}</span>${m.last_error ? `<div class="muted" style="font-size:12px;color:var(--red)">${esc(m.last_error)}</div>` : ''}</td>
+      <td class="n">${m.last_row_count ?? '—'}</td>
+      <td>${m.new_rows ? `<span class="chip warn">${m.new_rows} new</span> <span class="muted" style="font-size:12px">${esc(m.new_keys.slice(0, 3).map((k) => { try { return JSON.parse(k).filter((x) => x !== null).join(' · '); } catch { return k; } }).join(', '))}</span>` : '<span class="muted">—</span>'}</td>
+      <td class="mono" style="font-size:12px">${m.last_run_at ? ago(m.last_run_at) : 'never'}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-mon-run="${m.id}">Run now</button> ${m.new_rows ? `<button class="btn sm" data-mon-seen="${m.id}">Mark seen</button>` : ''} <button class="btn sm ghost" data-mon-del="${m.id}">Remove</button></td>
+    </tr>`).join('')}
+  </tbody></table></div>`;
+  const act = (sel, fn) => mount.querySelectorAll(sel).forEach((b) => b.addEventListener('click', async () => { b.disabled = true; try { await fn(b); } catch (e) { toast(e.message); } renderMonitors(); refreshCounts(); }));
+  act('[data-mon-run]', (b) => api('POST', `/api/monitors/${b.dataset.monRun}/run`));
+  act('[data-mon-seen]', (b) => api('POST', `/api/monitors/${b.dataset.monSeen}/seen`));
+  act('[data-mon-del]', (b) => api('DELETE', `/api/monitors/${b.dataset.monDel}`));
 }
 
 // ---------- boot ----------
