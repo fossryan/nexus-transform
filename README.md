@@ -8,7 +8,7 @@ This is the working version of the *AI Transformation Builder* case study on iam
 
 | Piece | How it works |
 |---|---|
-| Data | Pulled at first boot from SEC EDGAR (company list + XBRL "frames"), Treasury Fiscal Data (quarterly FX), and FRED (yields, fed funds, CPI, unemployment). Refreshed weekly. Provenance is shown on the Data sources page. |
+| Data | Pulled at first boot from SEC EDGAR (company list, annual and quarterly XBRL "frames", SIC sector codes), Treasury Fiscal Data (quarterly FX), and FRED (yields, fed funds, CPI, unemployment). Sector codes fill in the background after the main load, largest companies first. Refreshed weekly; an older dataset missing new tables is rebuilt automatically. Provenance is shown on the Data sources page. |
 | SQL generation | Claude via the Messages API, forced to answer through a `propose_transformation` tool: SQL, plain-English summary, confidence, and `{line, note, severity}` assumptions. |
 | Self-repair | Every draft is compiled against the live schema. If SQLite rejects it, the error goes back to Claude once and the repair is logged. |
 | Confidence | Shown as **model-reported**, next to **system checks** the server computes independently (parses against schema, row count, columns that are mostly null, truncation). |
@@ -58,6 +58,8 @@ The first boot builds the dataset in the background (a banner shows progress). L
 - `financials` uses SEC calendar-year frames, not fiscal years. The AI is told this and should flag it.
 - Companies that report revenue under a less common XBRL tag will show `NULL` revenue.
 - Treasury rates are quarterly, so this is not a daily FX source.
+- Quarterly Q4 income figures are often missing (companies report the full year in the 10-K); derive Q4 as annual minus Q1–Q3.
+- Sectors use SEC SIC codes, which are older and coarser than GICS.
 
 ## Tests
 

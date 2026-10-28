@@ -6,11 +6,12 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const view = $('#view');
 
 const EXAMPLES = [
-  'Top 15 companies by 2024 revenue, with net margin and year-over-year revenue growth',
-  'Monthly average 10-year minus 2-year Treasury spread since 2020; flag months when the curve was inverted',
-  'Euro and yen per US dollar by quarter since 2022, with quarter-over-quarter % change',
-  'Companies whose revenue grew every year from 2021 to 2024',
-  'Real fed funds rate by month: fed funds minus year-over-year CPI inflation',
+  'Which large companies kept operating margins steady through the 2022–23 rate hikes? Compare 2021 vs 2023 margins, revenue over $1B',
+  'Real revenue growth 2021→2024: adjust revenue for CPI inflation and rank the top 20 real growers with revenue over $1B',
+  'Estimate 2023 interest income on cash: cash × that year\'s average fed funds rate, top 15 companies',
+  'Median net margin and revenue growth by sector, 2024 vs 2023',
+  'Quarterly revenue since 2023 for the 10 largest software companies',
+  'How long was the 10-year/2-year Treasury yield curve inverted, and how deep did it get?',
 ];
 
 const state = {
@@ -136,12 +137,16 @@ async function loadStatus() {
   const b = [];
   if (s.mockAI) b.push(['warn', '<b>Mock AI mode.</b> Responses are canned test fixtures, not Claude. Set ANTHROPIC_API_KEY and remove MOCK_AI to go live.']);
   else if (!s.aiConfigured) b.push(['err', '<b>AI generation is off.</b> This server has no ANTHROPIC_API_KEY. You can still browse data and run your own SQL.']);
+  if (s.dataReady && !s.dataLoading && s.sectors && s.sectors.running && s.sectors.total) {
+    b.push(['info', `Adding SEC sector codes in the background: ${s.sectors.done.toLocaleString()} of ${s.sectors.total.toLocaleString()} companies, largest first. Sector questions work for the companies done so far.`]);
+  }
   if (!s.dataReady) b.push(['info', '<b>Loading the latest SEC, Treasury and FRED data…</b> The first start takes a few minutes. This page will update by itself.']);
   else if (s.dataLoading) b.push(['info', 'Refreshing the dataset in the background. Queries keep working on the current copy.']);
   $('#banners').innerHTML = b.map(([k, h]) => `<div class="banner ${k}">${h}</div>`).join('');
   $('#modelLine').textContent = s.mockAI ? 'AI · mock fixtures' : s.aiConfigured ? `AI · ${s.model}` : 'AI · not configured';
   $('#dataLine').textContent = s.dataReady ? 'Data · SEC · Treasury · FRED' : 'Data · loading…';
   if (!s.dataReady || s.dataLoading) setTimeout(loadStatus, 5000);
+  else if (s.sectors && s.sectors.running) setTimeout(loadStatus, 30000);
 }
 
 async function refreshCounts() {
@@ -239,7 +244,7 @@ function renderBuilder() {
         </div>
       </div>`
     : `<div class="page-head"><div><div class="crumb">Builder</div><h1>Plain English in. <em>SQL you can audit</em> out.</h1></div></div>
-       <p class="intro">Describe the data you need. The AI drafts SQL over <b>live SEC filings, Treasury exchange rates and FRED rates</b>, then marks every assumption on the line it affects. Nothing runs in production until you <b>accept</b> it, and every step lands in the audit log.</p>`;
+       <p class="intro">Describe the data you need. The AI drafts SQL over <b>live SEC filings (annual and quarterly, by sector), Treasury exchange rates and FRED rates</b>, then marks every assumption on the line it affects. Nothing runs in production until you <b>accept</b> it, and every step lands in the audit log.</p>`;
   view.innerHTML = `${head}${promptPanel()}${progressPanel()}<div id="reviewMount"></div>${tx ? '' : legend()}`;
   bindPrompt();
   renderReviewOnly();

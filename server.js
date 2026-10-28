@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const { createFinance } = require('./lib/finance');
 const { createStore } = require('./lib/store');
 const { createAI } = require('./lib/ai');
-const { buildDatabase } = require('./lib/loader');
+const { buildDatabase, fillSectors, REQUIRED_TABLES } = require('./lib/loader');
 
 const PORT = Number(process.env.PORT || 8080);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -25,7 +25,7 @@ const ai = createAI({ apiKey: process.env.ANTHROPIC_API_KEY, model: MODEL, mock:
 const aiConfigured = MOCK_AI || !!process.env.ANTHROPIC_API_KEY;
 
 // ---------- dataset loading ----------
-const loadState = { loading: false, errors: [], lastBuilt: null };
+const loadState = { loading: false, errors: [], lastBuilt: null, sectors: { running: false, done: 0, total: 0 } };
 function refreshData(reason) {
   if (loadState.loading) return;
   loadState.loading = true;
@@ -33,26 +33,50 @@ function refreshData(reason) {
   buildDatabase({ outPath: FINANCE_DB, secUserAgent: process.env.SEC_USER_AGENT, log: (l) => console.log(l) })
     .then(({ errors }) => { loadState.errors = errors; loadState.lastBuilt = new Date().toISOString(); finance.invalidate(); console.log(`Dataset ready (${errors.length} warnings).`); })
     .catch((e) => { loadState.errors = [String(e.message || e)]; console.error('Dataset build failed:', e); })
-    .finally(() => { loadState.loading = false; });
+    .finally(() => { loadState.loading = false; startSectorFill(); });
+}
+// Sector codes are fetched one company at a time, so they fill in after the main load.
+function startSectorFill() {
+  if (loadState.sectors.running) { loadState.sectors.again = true; return; } // restart once the current run stops
+  if (loadState.loading || !process.env.SEC_USER_AGENT || !finance.exists()) return;
+  loadState.sectors.running = true;
+  loadState.sectors.again = false;
+  fillSectors({
+    dbPath: FINANCE_DB, secUserAgent: process.env.SEC_USER_AGENT, log: (l) => console.log(l),
+    onProgress: (p) => { loadState.sectors.done = p.done; loadState.sectors.total = p.total; finance.invalidate(); },
+    shouldStop: () => loadState.loading,
+  })
+    .catch((e) => console.error('Sector fill failed:', e))
+    .finally(() => {
+      loadState.sectors.running = false;
+      finance.invalidate();
+      if (loadState.sectors.again) startSectorFill();
+    });
 }
 function dataAgeDays() {
   try { return (Date.now() - fs.statSync(FINANCE_DB).mtimeMs) / 86400000; } catch { return Infinity; }
 }
-// Sources that were skipped (e.g. SEC_USER_AGENT missing) or failed on the last build.
-function incompleteSources() {
+// Why the existing dataset needs rebuilding: tables from a newer app version are missing,
+// or a source was skipped (e.g. SEC_USER_AGENT missing) or failed on the last build.
+function rebuildReasons() {
   try {
     const { DatabaseSync } = require('node:sqlite');
     const db = new DatabaseSync(FINANCE_DB, { readOnly: true });
-    const rows = db.prepare("SELECT table_name, status FROM data_sources WHERE status != 'ok'").all();
+    const have = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name));
+    const missing = REQUIRED_TABLES.filter((t) => !have.has(t));
+    const bad = have.has('data_sources')
+      ? db.prepare("SELECT table_name, status FROM data_sources WHERE status IN ('skipped','error')").all().map((r) => `${r.table_name} (${r.status})`)
+      : [];
     db.close();
-    return rows.map((r) => `${r.table_name} (${r.status})`);
-  } catch { return []; }
+    return [...missing.map((t) => `new table ${t}`), ...bad];
+  } catch (e) { return [`unreadable dataset: ${e.message}`]; }
 }
 if (process.env.SKIP_DATA_LOAD !== '1') {
-  const incomplete = finance.exists() ? incompleteSources() : [];
+  const reasons = finance.exists() ? rebuildReasons() : [];
   if (!finance.exists()) refreshData('first run');
-  else if (incomplete.length) refreshData(`retrying incomplete sources: ${incomplete.join(', ')}`);
+  else if (reasons.length) refreshData(`rebuilding: ${reasons.join(', ')}`);
   else if (dataAgeDays() > REFRESH_DAYS) refreshData('scheduled refresh');
+  else startSectorFill();
   setInterval(() => { if (dataAgeDays() > REFRESH_DAYS) refreshData('scheduled refresh'); }, 6 * 3600 * 1000).unref();
 }
 
@@ -224,6 +248,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/status') {
       return json(res, 200, {
         dataReady: finance.exists(), dataLoading: loadState.loading, dataWarnings: loadState.errors.length,
+        sectors: loadState.sectors,
         aiConfigured, mockAI: MOCK_AI, model: ai.model,
         limits: { perHour: MAX_PER_HOUR, perDay: MAX_PER_DAY, usedToday: store.dailyUsage() },
       });

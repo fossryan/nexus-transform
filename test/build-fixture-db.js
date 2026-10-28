@@ -2,7 +2,7 @@
 // Builds a finance.db from PLACEHOLDER data shaped exactly like the real API responses.
 // Used only for offline tests. Company names are deliberately fake ("Placeholder …").
 const path = require('node:path');
-const { buildDatabase } = require('../lib/loader');
+const { buildDatabase, fillSectors } = require('../lib/loader');
 
 const companies = {};
 const names = ['Placeholder Alpha Corp', 'Placeholder Beta Inc', 'Placeholder Gamma Holdings', 'Placeholder Delta Systems', 'Placeholder Epsilon Bank',
@@ -15,13 +15,22 @@ const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
 
 async function getJson(url) {
   if (url.includes('company_tickers')) return companies;
-  const m = url.match(/frames\/us-gaap\/(\w+)\/USD\/CY(\d{4})(Q4I)?\.json/);
+  const sub = url.match(/submissions\/CIK(\d{10})\.json/);
+  if (sub) {
+    const i = Number(sub[1]) - 1000;
+    if (i === 11) return null; // simulate a filer with no submissions record
+    const sics = [7372, 6021, 2834, 3571, 5331, 1311, 4911, 7372, 3711, 2000, 4841, 6211];
+    return { cik: sub[1], sic: String(sics[i]), sicDescription: `Placeholder industry ${sics[i]}`, fiscalYearEnd: i % 3 ? '1231' : '0930' };
+  }
+  const m = url.match(/frames\/us-gaap\/(\w+)\/USD\/CY(\d{4})(Q\d)?(I)?\.json/);
   if (m) {
-    const [, tag, year] = m;
+    const [, tag, year, qtr] = m;
+    const qScale = qtr && !m[4] ? 0.25 : 1;
     if (tag === 'SalesRevenueNet' || (tag === 'Revenues' && year < 2020)) return null; // simulate 404s
+    if (qtr === 'Q4' && !m[4]) return null; // Q4 income usually only in the 10-K
     const data = names.map((n, i) => {
       if (tag === 'OperatingIncomeLoss' && i % 5 === 4) return null; // some companies don't report a metric
-      const scale = (i + 1) * 1e9 * (1 + (year - 2018) * 0.06);
+      const scale = (i + 1) * 1e9 * (1 + (year - 2018) * 0.06) * qScale;
       const val = tag.includes('Income') ? Math.round(scale * (0.05 + rand() * 0.2) * (i === 10 ? -1 : 1)) : Math.round(scale * (0.5 + rand()));
       return { accn: `0000000000-${year}-${i}`, cik: 1000 + i, entityName: n, loc: 'US-XX', end: `${year}-12-31`, val };
     }).filter(Boolean);
@@ -58,4 +67,10 @@ async function getText(url) {
 
 const out = process.argv[2] || path.join(__dirname, '..', 'data', 'finance.db');
 buildDatabase({ outPath: out, secUserAgent: 'test fixture', fetchers: { getJson, getText }, log: () => {} })
-  .then(({ errors }) => { console.log(`fixture db → ${out}; warnings: ${errors.length}`); errors.forEach((e) => console.log('  ', e)); });
+  .then(async ({ errors }) => {
+    console.log(`fixture db → ${out}; warnings: ${errors.length}`); errors.forEach((e) => console.log('  ', e));
+    if (!process.argv.includes('--no-sectors')) {
+      const r = await fillSectors({ dbPath: out, secUserAgent: 'test fixture', fetchers: { getJson, getText }, log: () => {} });
+      console.log(`sectors filled: ${r.done}, remaining: ${r.remaining}`);
+    }
+  });
