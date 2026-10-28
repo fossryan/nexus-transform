@@ -104,12 +104,24 @@ function preview(result) {
 }
 
 // ---------- scans & monitors ----------
+const DATA_LABELS = {
+  annual_financials: 'company fundamentals', company_ratios: 'company fundamentals', company_scores: 'company fundamentals',
+  filing_events: '8-K filings', insider_trades: 'insider trades (Form 4)', fund_position_changes: 'fund holdings (13F)',
+  fund_holdings: 'fund holdings (13F)', valuation: 'stock prices', prices: 'stock prices',
+};
+const SCAN_TABLES = Object.keys(DATA_LABELS);
 async function runScans() {
   if (scanCache.results && Date.now() - scanCache.at < 30 * 60 * 1000) return scanCache.results;
-  const tables = new Set(((finance.describe() || {}).tables || []).map((t) => t.name));
+  const counts = new Map(((finance.describe() || {}).tables || []).map((t) => [t.name, t.rowCount]));
   const results = [];
   for (const sc of SCANS) {
-    if (sc.requires && !tables.has(sc.requires)) { results.push({ id: sc.id, unavailable: `Needs ${sc.requires} data, which isn't loaded yet.` }); continue; }
+    // A scan needs every table it reads to exist and have rows; otherwise say what's still loading.
+    const missing = SCAN_TABLES.filter((t) => new RegExp(`\\b${t}\\b`).test(sc.sql) && !counts.get(t));
+    if (missing.length) {
+      const what = [...new Set(missing.map((t) => DATA_LABELS[t] || t))].join(' and ');
+      results.push({ id: sc.id, unavailable: `Waiting for ${what} to finish loading.`, loading: true });
+      continue;
+    }
     const r = await finance.run(sc.sql, { maxRows: 50 });
     results.push(r.ok
       ? { id: sc.id, count: r.rows.length, truncated: r.truncated, columns: r.columns.map((c) => c.name), rows: r.rows.slice(0, 5) }
@@ -232,6 +244,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         dataReady: finance.exists(), dataLoading: jobs.state.core.running, dataWarnings: jobs.state.core.warnings,
         jobs: jobs.state,
+        diagnostics: jobs.diagnostics(),
         aiConfigured, mockAI: MOCK_AI, model: ai.model,
         limits: { perHour: MAX_PER_HOUR, perDay: MAX_PER_DAY, usedToday: store.dailyUsage() },
       });

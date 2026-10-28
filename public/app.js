@@ -627,11 +627,37 @@ async function renderAudit() {
   </tbody></table></div>`;
 }
 
+// ---------- background job status ----------
+function jobLines(st) {
+  const j = (st && st.jobs) || {};
+  const line = (name, status, detail) => `<li class="${status}"><span class="ci">${{ ok: '✓', warn: '…', fail: '!', info: '·' }[status]}</span><span><b>${name}</b> — ${detail}</span></li>`;
+  const out = [];
+  if (j.core) out.push(j.core.running ? line('SEC fundamentals, Treasury, FRED', 'warn', 'building now (about 10–15 minutes)')
+    : j.core.lastFailed && (!j.core.lastBuilt || j.core.lastFailed > j.core.lastBuilt) ? line('SEC fundamentals, Treasury, FRED', 'fail', `last refresh incomplete ${ago(j.core.lastFailed)} — kept previous data, retrying`)
+    : line('SEC fundamentals, Treasury, FRED', st.dataReady ? 'ok' : 'info', st.dataReady ? (j.core.lastBuilt ? `updated ${ago(j.core.lastBuilt)}` : 'loaded') : 'waiting'));
+  if (j.derive) out.push(j.derive.running ? line('Ratios, scores, peer ranks', 'warn', 'rebuilding') : j.derive.error ? line('Ratios, scores, peer ranks', 'fail', j.derive.error) : line('Ratios, scores, peer ranks', j.derive.lastRun ? 'ok' : 'info', j.derive.lastRun ? `rebuilt ${ago(j.derive.lastRun)}` : 'waiting for fundamentals'));
+  if (j.profiles) out.push(j.profiles.running ? line('Sectors and 8-K events', 'warn', `${j.profiles.done.toLocaleString()} of ${j.profiles.total.toLocaleString()} companies`) : line('Sectors and 8-K events', j.profiles.total ? 'ok' : 'info', j.profiles.total ? 'up to date' : 'queued after fundamentals'));
+  if (j.ownership) out.push(j.ownership.running ? line('Insider trades and fund holdings', 'warn', 'downloading SEC data sets') : j.ownership.lastRun ? line('Insider trades and fund holdings', j.ownership.errors ? 'fail' : 'ok', j.ownership.errors ? `${j.ownership.errors} file(s) failed ${ago(j.ownership.lastRun)}` : `checked ${ago(j.ownership.lastRun)}`) : line('Insider trades and fund holdings', 'info', 'queued after sectors'));
+  if (j.prices) out.push(!j.prices.configured ? line('Stock prices', 'info', 'off — set FINNHUB_API_KEY') : j.prices.running ? line('Stock prices', 'warn', `${j.prices.done.toLocaleString()} of ${j.prices.total.toLocaleString()} companies`) : line('Stock prices', 'ok', 'daily refresh'));
+  return out.join('');
+}
+function jobPanel(st) {
+  const d = (st && st.diagnostics) || {};
+  const probs = (d.problems || []).slice(0, 6);
+  return `<div class="panel jobs"><h4>Background data jobs</h4><ul class="checks">${jobLines(st)}</ul>
+    ${d.lastStep ? `<p class="micro" style="margin:10px 0 0">Latest step · ${esc(d.lastStep.message)} · ${ago(d.lastStep.at)}</p>` : ''}
+    ${probs.length ? `<details style="margin-top:10px"><summary class="micro" style="cursor:pointer;color:var(--amber)">${probs.length} recent problem${probs.length === 1 ? '' : 's'}</summary><ul class="probs">${probs.map((p) => `<li><span class="mono muted">${ago(p.at)}</span> ${esc(p.message)}</li>`).join('')}</ul></details>` : ''}
+  </div>`;
+}
+
 // ---------- data sources ----------
 async function renderData() {
   view.innerHTML = `<div class="page-head"><div><div class="crumb">Catalog</div><h1>Data <em>sources</em></h1></div></div>
     <p class="intro" style="font-size:13.5px">Everything the AI can query, with where it came from and when it was pulled. The AI sees these same column notes, which is why it can flag caveats like <b>calendar vs fiscal year</b> on the line where they matter.</p>
+    <div id="jobMount"></div>
     <div id="dataMount" class="sources"><div class="empty">Loading…</div></div>`;
+  await loadStatus();
+  $('#jobMount').innerHTML = jobPanel(state.status);
   let d;
   try { d = await api('GET', '/api/schema'); } catch (e) { $('#dataMount').innerHTML = `<div class="panel empty">${esc(e.message)}</div>`; return; }
   $('#dataMount').innerHTML = d.tables.filter((t) => t.name !== 'data_sources').map((t) => `
@@ -779,9 +805,10 @@ async function renderScans() {
     <p class="intro" style="font-size:13.5px">Ready-made screens over every company in the dataset — forensic scores, cash burn, debt surges, red-flag filings, insider buying and fund flows. They are plain SQL with no AI, so they're free to run. Open one to review the SQL and notes, accept it, explain it, or watch it for changes.</p>
     <div id="scanMount" class="scans"><div class="empty">Running scans…</div></div>`;
   let scans;
+  await loadStatus();
   try { scans = await api('GET', '/api/scans'); } catch (e) { $('#scanMount').innerHTML = `<div class="panel empty">${esc(e.message)}</div>`; return; }
   const card = (sc) => {
-    const status = sc.unavailable ? `<span class="chip info">Not loaded</span>` : sc.error ? `<span class="chip error">Error</span>` : `<span class="chip ${sc.count ? (sc.category === 'risk' ? 'warn' : 'ok') : 'info'}">${sc.count}${sc.truncated ? '+' : ''} match${sc.count === 1 ? '' : 'es'}</span>`;
+    const status = sc.unavailable ? `<span class="chip ${sc.loading ? 'warn' : 'info'}">${sc.loading ? 'Loading' : 'Not loaded'}</span>` : sc.error ? `<span class="chip error">Error</span>` : `<span class="chip ${sc.count ? (sc.category === 'risk' ? 'warn' : 'ok') : 'info'}">${sc.count}${sc.truncated ? '+' : ''} match${sc.count === 1 ? '' : 'es'}</span>`;
     const preview = sc.rows && sc.rows.length ? `<table class="data mini"><tbody>${sc.rows.slice(0, 3).map((r) => `<tr>${r.slice(0, 3).map((v) => `<td class="${typeof v === 'number' ? 'n' : ''}">${esc(typeof v === 'number' ? fmtNum(v, { plain: false }) : v)}</td>`).join('')}</tr>`).join('')}</tbody></table>` : '';
     return `<div class="panel scan ${sc.category}">
       <div class="scan-top"><span class="micro">${sc.category === 'risk' ? '▲ Risk' : '◆ Opportunity'}</span>${status}</div>
@@ -793,7 +820,8 @@ async function renderScans() {
       <div><button class="btn sm ${sc.unavailable ? '' : 'primary'}" data-open-scan="${sc.id}" ${sc.unavailable ? 'disabled' : ''}>Open in builder →</button></div>
     </div>`;
   };
-  $('#scanMount').innerHTML = scans.map(card).join('');
+  const waiting = scans.filter((x) => x.loading).length;
+  $('#scanMount').innerHTML = (waiting ? `<div style="grid-column:1/-1">${jobPanel(state.status)}</div>` : '') + scans.map(card).join('');
   view.querySelectorAll('[data-open-scan]').forEach((b) => b.addEventListener('click', async () => {
     b.disabled = true;
     try {
