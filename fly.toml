@@ -1,27 +1,32 @@
-# Change "app" to a name that's free on Fly.io before the first deploy.
-app = "nexus-transform"
-primary_region = "bos"
+# fly.toml app configuration file generated for nexus-transform on 2026-10-28T14:14:23Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'nexus-transform'
+primary_region = 'ams'
 
 [build]
 
 [env]
-  DATA_DIR = "/data"
-  PORT = "8080"
-  MAX_GENERATIONS_PER_HOUR = "25"
-  MAX_DAILY_GENERATIONS = "400"
+  DATA_DIR = '/data'
+  MAX_DAILY_GENERATIONS = '400'
+  MAX_GENERATIONS_PER_HOUR = '25'
+  PORT = '8080'
 
 [[mounts]]
-  source = "nexus_data"
-  destination = "/data"
+  source = 'nexus_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
 [[vm]]
-  memory = "512mb"
-  cpu_kind = "shared"
+  memory = '512mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256
