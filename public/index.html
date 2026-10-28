@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexus Transform — AI SQL you can audit</title>
+  <meta name="description" content="Describe a financial data transformation in plain English. AI drafts the SQL over live SEC, Treasury and FRED data, flags every assumption line by line, and you decide: accept, edit or reject.">
+  <meta name="theme-color" content="#0a0d12">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,500;1,9..144,300;1,9..144,500&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#/builder">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 18V6l8 12V6M14 6h6M14 12h4M14 18h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>NEXUS<em>transform</em></span>
+      </a>
+      <nav class="nav">
+        <a href="#/builder" data-nav="builder"><span class="ic">✦</span><span>Builder</span></a>
+        <a href="#/transformations" data-nav="transformations"><span class="ic">⊞</span><span>Transformations</span><b class="badge" id="navTxCount"></b></a>
+        <a href="#/audit" data-nav="audit"><span class="ic">⚑</span><span>Audit log</span><b class="badge" id="navAuditCount"></b></a>
+        <a href="#/data" data-nav="data"><span class="ic">⟡</span><span>Data sources</span></a>
+      </nav>
+      <div class="side-foot">
+        <label class="who">
+          <span class="micro">Reviewing as</span>
+          <input id="actorInput" maxlength="24" spellcheck="false" autocomplete="off" aria-label="Your display name for the audit log">
+        </label>
+        <div class="micro" id="modelLine"></div>
+        <div class="micro" id="dataLine"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="banners"></div>
+      <section id="view"></section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <dialog id="rejectDialog">
+    <form method="dialog">
+      <h3>Reject this version?</h3>
+      <p class="muted">The reason goes into the audit log so the next person knows why.</p>
+      <textarea id="rejectNote" rows="3" maxlength="300" placeholder="e.g. Should use fiscal year, not calendar year"></textarea>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn ghost">Cancel</button>
+        <button value="confirm" class="btn danger">Reject</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

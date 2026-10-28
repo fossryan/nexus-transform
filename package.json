@@ -1,0 +1,14 @@
+{
+  "name": "nexus-transform",
+  "version": "1.0.0",
+  "description": "AI-assisted SQL transformation builder with line-level assumptions, human review and an audit log, over live SEC, Treasury and FRED data.",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "load-data": "node --no-warnings lib/loader.js",
+    "dev:mock": "node --no-warnings test/build-fixture-db.js && MOCK_AI=1 SKIP_DATA_LOAD=1 node --no-warnings server.js",
+    "test": "node test/smoke.js"
+  }
+}
