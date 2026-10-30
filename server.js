@@ -8,6 +8,7 @@ const { createStore } = require('./lib/store');
 const { createAI } = require('./lib/ai');
 const { createJobs } = require('./lib/jobs');
 const { SCANS, scanNotes } = require('./lib/scans');
+const disk = require('./lib/disk');
 
 const PORT = Number(process.env.PORT || 8080);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -19,8 +20,19 @@ const MAX_PER_DAY = Number(process.env.MAX_DAILY_GENERATIONS || 400);
 const PREVIEW_ROWS = 500;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+// Startup must survive a full volume: clear temp files from interrupted jobs, and if the
+// app's own database still can't open, release the space reserve and retry.
+const startupLog = (l) => console.log(l);
+disk.cleanLeftovers(DATA_DIR, startupLog);
 const finance = createFinance(FINANCE_DB);
-const store = createStore(path.join(DATA_DIR, 'app.db'));
+const opened = disk.openWithRecovery(() => createStore(path.join(DATA_DIR, 'app.db')), {
+  dataDir: DATA_DIR, log: startupLog, fallback: () => createStore(':memory:'),
+});
+const store = opened.value;
+const storageDegraded = opened.degraded; // true = disk full; transformations aren't being saved
+disk.ensureReserve(DATA_DIR, 64 * disk.MB);
+const startDisk = disk.diskStatus(DATA_DIR);
+if (startDisk) console.log(`· Disk: ${startDisk.freeMb} MB free of ${startDisk.totalMb} MB (${startDisk.usedPct}% used)`);
 const ai = createAI({ apiKey: process.env.ANTHROPIC_API_KEY, model: MODEL, mock: MOCK_AI });
 const aiConfigured = MOCK_AI || !!process.env.ANTHROPIC_API_KEY;
 
@@ -244,7 +256,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         dataReady: finance.exists(), dataLoading: jobs.state.core.running, dataWarnings: jobs.state.core.warnings,
         jobs: jobs.state,
-        diagnostics: jobs.diagnostics(),
+        diagnostics: jobs.diagnostics(), // includes disk: { freeMb, totalMb, usedPct, skipped }
+        storageDegraded,
         aiConfigured, mockAI: MOCK_AI, model: ai.model,
         limits: { perHour: MAX_PER_HOUR, perDay: MAX_PER_DAY, usedToday: store.dailyUsage() },
       });
