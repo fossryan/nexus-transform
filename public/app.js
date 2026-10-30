@@ -639,6 +639,13 @@ function jobLines(st) {
   if (j.profiles) out.push(j.profiles.running ? line('Sectors and 8-K events', 'warn', `${j.profiles.done.toLocaleString()} of ${j.profiles.total.toLocaleString()} companies`) : line('Sectors and 8-K events', j.profiles.total ? 'ok' : 'info', j.profiles.total ? 'up to date' : 'queued after fundamentals'));
   if (j.ownership) out.push(j.ownership.running ? line('Insider trades and fund holdings', 'warn', 'downloading SEC data sets') : j.ownership.lastRun ? line('Insider trades and fund holdings', j.ownership.errors ? 'fail' : 'ok', j.ownership.errors ? `${j.ownership.errors} file(s) failed ${ago(j.ownership.lastRun)}` : `checked ${ago(j.ownership.lastRun)}`) : line('Insider trades and fund holdings', 'info', 'queued after sectors'));
   if (j.prices) out.push(!j.prices.configured ? line('Stock prices', 'info', 'off — set FINNHUB_API_KEY') : j.prices.running ? line('Stock prices', 'warn', `${j.prices.done.toLocaleString()} of ${j.prices.total.toLocaleString()} companies`) : line('Stock prices', 'ok', 'daily refresh'));
+  const dk = st && st.diagnostics && st.diagnostics.disk;
+  if (st && st.storageDegraded) out.push(line('Storage', 'fail', 'disk full — running on temporary storage; new work is lost on restart'));
+  else if (dk && dk.totalMb) {
+    const paused = Object.keys(dk.skipped || {});
+    const detail = `${dk.freeMb.toLocaleString()} MB free of ${dk.totalMb.toLocaleString()} MB${paused.length ? ` — paused for space: ${paused.join(', ')}` : ''}`;
+    out.push(line('Storage', paused.length || dk.usedPct >= 90 ? 'fail' : dk.usedPct >= 75 ? 'warn' : 'ok', detail));
+  }
   return out.join('');
 }
 function jobPanel(st) {

@@ -10,6 +10,7 @@
     "dev:mock": "node --no-warnings test/build-fixture-db.js && MOCK_AI=1 SKIP_DATA_LOAD=1 node --no-warnings server.js",
     "fixtures": "node --no-warnings test/build-fixture-db.js",
     "test": "node test/smoke.js",
-    "test:api": "node test/api-contract.js"
+    "test:api": "node test/api-contract.js",
+    "test:disk": "node --no-warnings test/disk.js"
   }
 }

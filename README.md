@@ -43,6 +43,14 @@ fly deploy -a nexus-transform
 
 First boot: core data ~10–15 min, then sectors/8-K events (~15 min), insider + 13F files, and prices (~35 min) fill in the background. Banners show progress; everything already loaded is usable meanwhile.
 
+### Disk space
+
+A full volume no longer takes the app down (`lib/disk.js`, tested by `npm run test:disk`):
+
+- **Startup** removes temp files from interrupted jobs, keeps a 64 MB `.space-reserve` file it can release in an emergency, and if `app.db` still can't open, runs on temporary in-memory storage (work saved then is lost on restart). Finance data is read in SQLite's immutable mode when the disk is too full to read normally.
+- **Background jobs** check free space before they start and skip the run (retrying every 6 hours) instead of filling the disk. A rebuild needs about 1.3× `finance.db`; SEC ownership files need ~400 MB; plus `MIN_FREE_MB` always kept free.
+- **Data → Background data jobs** shows a *Storage* line with free space and any paused jobs. If it's red, run `fly volumes extend`, then restart the machine.
+
 ## Settings (env vars)
 
 | Variable | Default | Purpose |
@@ -55,6 +63,7 @@ First boot: core data ~10–15 min, then sectors/8-K events (~15 min), insider +
 | `MAX_GENERATIONS_PER_HOUR` | 25 | Per browser session (generations + explanations) |
 | `MAX_DAILY_GENERATIONS` | 400 | Whole server — caps API spend |
 | `DATA_REFRESH_DAYS` | 7 | Rebuild core data when older than this |
+| `MIN_FREE_MB` | 250 | Free space (MB) background jobs always leave on the volume |
 | `QUERY_TIMEOUT_MS` | 8000 | Per-query time limit |
 
 ## Known limits
