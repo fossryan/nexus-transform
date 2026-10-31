@@ -801,35 +801,58 @@ async function explain(v) {
 
 // ---------- insights (predefined scans) ----------
 async function renderScans() {
-  view.innerHTML = `<div class="page-head"><div><div class="crumb">Insights</div><h1>Scans that find <em>signals</em></h1></div></div>
+  view.innerHTML = `<div class="page-head"><div><div class="crumb">Insights</div><h1>Scans that find <em>signals</em></h1></div><span class="micro" id="scanState"></span></div>
     <p class="intro" style="font-size:13.5px">Ready-made screens over every company in the dataset — forensic scores, cash burn, debt surges, red-flag filings, insider buying and fund flows. They are plain SQL with no AI, so they're free to run. Open one to review the SQL and notes, accept it, explain it, or watch it for changes.</p>
-    <div id="scanMount" class="scans"><div class="empty">Running scans…</div></div>`;
-  let scans;
-  await loadStatus();
-  try { scans = await api('GET', '/api/scans'); } catch (e) { $('#scanMount').innerHTML = `<div class="panel empty">${esc(e.message)}</div>`; return; }
+    <div id="scanJobs"></div>
+    <div id="scanMount" class="scans"></div>`;
+  loadStatus().then(() => paintJobs());
+  let lastScans = [];
+  const paintJobs = () => {
+    const el = $('#scanJobs');
+    if (el) el.innerHTML = lastScans.some((x) => x.loading) && state.status ? jobPanel(state.status) : '';
+  };
   const card = (sc) => {
-    const status = sc.unavailable ? `<span class="chip ${sc.loading ? 'warn' : 'info'}">${sc.loading ? 'Loading' : 'Not loaded'}</span>` : sc.error ? `<span class="chip error">Error</span>` : `<span class="chip ${sc.count ? (sc.category === 'risk' ? 'warn' : 'ok') : 'info'}">${sc.count}${sc.truncated ? '+' : ''} match${sc.count === 1 ? '' : 'es'}</span>`;
-    const preview = sc.rows && sc.rows.length ? `<table class="data mini"><tbody>${sc.rows.slice(0, 3).map((r) => `<tr>${r.slice(0, 3).map((v) => `<td class="${typeof v === 'number' ? 'n' : ''}">${esc(typeof v === 'number' ? fmtNum(v, { plain: false }) : v)}</td>`).join('')}</tr>`).join('')}</tbody></table>` : '';
-    return `<div class="panel scan ${sc.category}">
+    const status = sc.pending ? '<span class="chip info">Running…</span>'
+      : sc.unavailable ? `<span class="chip ${sc.loading ? 'warn' : 'info'}">${sc.loading ? 'Loading data' : 'Not loaded'}</span>`
+      : sc.error ? '<span class="chip error">Error</span>'
+      : `<span class="chip ${sc.count ? (sc.category === 'risk' ? 'warn' : 'ok') : 'info'}">${sc.count}${sc.truncated ? '+' : ''} match${sc.count === 1 ? '' : 'es'}</span>`;
+    const preview = sc.rows && sc.rows.length ? `<table class="data mini"><tbody>${sc.rows.slice(0, 3).map((r) => `<tr>${r.slice(0, 3).map((v) => `<td class="${typeof v === 'number' ? 'n' : ''}">${esc(typeof v === 'number' ? fmtNum(v, { plain: false }) : v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+      : sc.pending ? '<div class="skeleton"></div>' : '';
+    const blocked = sc.unavailable;
+    return `<div class="panel scan ${sc.category}" data-scan="${sc.id}">
       <div class="scan-top"><span class="micro">${sc.category === 'risk' ? '▲ Risk' : '◆ Opportunity'}</span>${status}</div>
       <h3>${esc(sc.title)}</h3>
       <p class="q">${esc(sc.question)}</p>
       <p class="why">${esc(sc.why)}</p>
       ${sc.unavailable ? `<p class="why">${esc(sc.unavailable)}</p>` : ''}${sc.error ? `<p class="why">${esc(sc.error)}</p>` : ''}
       ${preview}
-      <div><button class="btn sm ${sc.unavailable ? '' : 'primary'}" data-open-scan="${sc.id}" ${sc.unavailable ? 'disabled' : ''}>Open in builder →</button></div>
+      <div><button class="btn sm ${blocked ? '' : 'primary'}" data-open-scan="${sc.id}" ${blocked ? 'disabled' : ''}>Open in builder →</button></div>
     </div>`;
   };
-  const waiting = scans.filter((x) => x.loading).length;
-  $('#scanMount').innerHTML = (waiting ? `<div style="grid-column:1/-1">${jobPanel(state.status)}</div>` : '') + scans.map(card).join('');
-  view.querySelectorAll('[data-open-scan]').forEach((b) => b.addEventListener('click', async () => {
-    b.disabled = true;
+  // Clicks are handled once on the container, so repainting cards doesn't lose them.
+  $('#scanMount').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-open-scan]');
+    if (!b || b.disabled) return;
+    b.disabled = true; b.textContent = 'Opening…';
     try {
       const r = await api('POST', `/api/scans/${b.dataset.openScan}/open`);
       state.tx = r.transformation; state.versionId = r.version.id; state.preview = r.preview; state.previewFor = r.version.id; state.tab = 'results';
       location.hash = `#/builder/${r.transformation.id}`; refreshCounts();
-    } catch (e) { toast(e.message); b.disabled = false; }
-  }));
+    } catch (err) { toast(err.message); b.disabled = false; b.textContent = 'Open in builder →'; }
+  });
+  const poll = async () => {
+    if (!location.hash.startsWith('#/scans')) return;
+    let data;
+    try { data = await api('GET', '/api/scans'); } catch (e) { $('#scanMount').innerHTML = `<div class="panel empty">${esc(e.message)}</div>`; return; }
+    lastScans = data.scans;
+    $('#scanMount').innerHTML = data.scans.map(card).join('');
+    paintJobs();
+    const busy = data.refreshing || data.scans.some((x) => x.pending);
+    $('#scanState').textContent = busy ? 'Updating results…' : '';
+    if (busy) setTimeout(poll, 3000);
+    else if (data.scans.some((x) => x.loading)) setTimeout(poll, 30000);
+  };
+  poll();
 }
 
 // ---------- monitors ----------

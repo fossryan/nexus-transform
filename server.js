@@ -26,16 +26,22 @@ const aiConfigured = MOCK_AI || !!process.env.ANTHROPIC_API_KEY;
 
 // ---------- background data jobs ----------
 let monitorTimer = null;
-const scanCache = { at: 0, results: null };
+const scanCache = { at: 0, results: new Map(), running: null, stale: true };
+let scanTimer = null;
 function onDataChanged() {
   finance.invalidate();
-  scanCache.results = null;
+  // Keep showing the last scan results; refresh them in the background once data settles.
+  scanCache.stale = true;
+  clearTimeout(scanTimer);
+  scanTimer = setTimeout(() => refreshScans(), 20000);
+  scanTimer.unref();
   clearTimeout(monitorTimer); // re-run saved monitors shortly after data changes (debounced)
   monitorTimer = setTimeout(() => runAllMonitors().catch((e) => console.error('monitors:', e)), 15000);
   monitorTimer.unref();
 }
 const jobs = createJobs({ dataDir: DATA_DIR, log: (l) => console.log(l), onDataChanged });
 if (process.env.SKIP_DATA_LOAD !== '1') jobs.start();
+setTimeout(() => { if (!scanCache.at && !scanCache.running) refreshScans(); }, 3000).unref(); // warm the cache
 
 // ---------- helpers ----------
 const json = (res, status, body) => {
@@ -105,30 +111,51 @@ function preview(result) {
 
 // ---------- scans & monitors ----------
 const DATA_LABELS = {
-  annual_financials: 'company fundamentals', company_ratios: 'company fundamentals', company_scores: 'company fundamentals',
+  latest_complete_year: 'company fundamentals', annual_financials: 'company fundamentals', company_ratios: 'company fundamentals', company_scores: 'company fundamentals',
   filing_events: '8-K filings', insider_trades: 'insider trades (Form 4)', fund_position_changes: 'fund holdings (13F)',
   fund_holdings: 'fund holdings (13F)', valuation: 'stock prices', prices: 'stock prices',
 };
 const SCAN_TABLES = Object.keys(DATA_LABELS);
-async function runScans() {
-  if (scanCache.results && Date.now() - scanCache.at < 30 * 60 * 1000) return scanCache.results;
-  const counts = new Map(((finance.describe() || {}).tables || []).map((t) => [t.name, t.rowCount]));
-  const results = [];
-  for (const sc of SCANS) {
-    // A scan needs every table it reads to exist and have rows; otherwise say what's still loading.
-    const missing = SCAN_TABLES.filter((t) => new RegExp(`\\b${t}\\b`).test(sc.sql) && !counts.get(t));
-    if (missing.length) {
-      const what = [...new Set(missing.map((t) => DATA_LABELS[t] || t))].join(' and ');
-      results.push({ id: sc.id, unavailable: `Waiting for ${what} to finish loading.`, loading: true });
-      continue;
-    }
-    const r = await finance.run(sc.sql, { maxRows: 50 });
-    results.push(r.ok
-      ? { id: sc.id, count: r.rows.length, truncated: r.truncated, columns: r.columns.map((c) => c.name), rows: r.rows.slice(0, 5) }
-      : { id: sc.id, error: r.error });
+// Scans run in the background (two at a time) and results are cached, so the Insights page
+// never waits on them. Results from before a data refresh are shown until new ones finish.
+async function runOneScan(sc, counts) {
+  // A scan needs every table it reads to exist and have rows; otherwise say what's still loading.
+  const missing = SCAN_TABLES.filter((t) => new RegExp(`\\b${t}\\b`).test(sc.sql) && !counts.get(t));
+  if (missing.length) {
+    const what = [...new Set(missing.map((t) => DATA_LABELS[t] || t))].join(' and ');
+    return { id: sc.id, unavailable: `Waiting for ${what} to finish loading.`, loading: true };
   }
-  scanCache.results = results; scanCache.at = Date.now();
-  return results;
+  const started = Date.now();
+  const r = await finance.run(sc.sql, { maxRows: 50, timeoutMs: 30000 });
+  return r.ok
+    ? { id: sc.id, count: r.rows.length, truncated: r.truncated, columns: r.columns.map((c) => c.name), rows: r.rows.slice(0, 5), ms: Date.now() - started }
+    : { id: sc.id, error: r.timeout ? 'Timed out while the server was busy loading data — it will retry automatically.' : r.error };
+}
+function refreshScans() {
+  if (scanCache.running) { scanCache.stale = true; return scanCache.running; }
+  scanCache.stale = false;
+  scanCache.running = (async () => {
+    const d = await finance.describe();
+    const counts = new Map(((d || {}).tables || []).map((t) => [t.name, t.rowCount]));
+    const queue = [...SCANS];
+    const worker = async () => {
+      while (queue.length) {
+        const sc = queue.shift();
+        try { scanCache.results.set(sc.id, { ...(await runOneScan(sc, counts)), at: Date.now() }); }
+        catch (e) { scanCache.results.set(sc.id, { id: sc.id, error: e.message, at: Date.now() }); }
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    scanCache.at = Date.now();
+  })().catch((e) => console.error('scans:', e)).finally(() => {
+    scanCache.running = null;
+    if (scanCache.stale) { clearTimeout(scanTimer); scanTimer = setTimeout(() => refreshScans(), 20000); scanTimer.unref(); }
+  });
+  return scanCache.running;
+}
+function scanResults() {
+  if (!scanCache.running && (scanCache.stale || Date.now() - scanCache.at > 30 * 60 * 1000)) refreshScans();
+  return SCANS.map((sc) => scanCache.results.get(sc.id) || { id: sc.id, pending: true });
 }
 
 const rowKey = (row) => JSON.stringify(row.slice(0, 2));
@@ -168,7 +195,7 @@ async function handleGenerate(req, res, sid) {
   const actor = actorName(req);
   try {
     send({ stage: 'schema', label: 'Reading the live schema' });
-    const schemaText = finance.promptSchema();
+    const schemaText = await finance.promptSchema();
     store.bumpDailyUsage();
 
     send({ stage: 'drafting', label: base ? 'Revising the SQL' : 'Drafting SQL' });
@@ -250,7 +277,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (req.method === 'GET' && p === '/api/schema') {
-      const d = finance.describe();
+      const d = await finance.describe();
       return d ? json(res, 200, d) : json(res, 503, { error: 'Dataset is still loading.' });
     }
     if (req.method === 'GET' && p === '/api/transformations') return json(res, 200, store.listTransformations(sid));
@@ -314,8 +341,11 @@ const server = http.createServer(async (req, res) => {
       return res.end(toCsv(result.columns.map((c) => c.name), result.rows));
     }
     if (req.method === 'GET' && p === '/api/scans') {
-      const results = Object.fromEntries((await runScans()).map((r) => [r.id, r]));
-      return json(res, 200, SCANS.map((sc) => ({ id: sc.id, title: sc.title, question: sc.question, why: sc.why, category: sc.category, ...results[sc.id] })));
+      const results = Object.fromEntries(scanResults().map((r) => [r.id, r]));
+      return json(res, 200, {
+        refreshing: !!scanCache.running,
+        scans: SCANS.map((sc) => ({ id: sc.id, title: sc.title, question: sc.question, why: sc.why, category: sc.category, ...results[sc.id] })),
+      });
     }
     if (req.method === 'POST' && (m = p.match(/^\/api\/scans\/([a-z_]+)\/open$/))) {
       const sc = SCANS.find((x) => x.id === m[1]);

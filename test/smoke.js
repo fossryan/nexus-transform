@@ -75,8 +75,11 @@ async function call(method, path, body) {
   const list = await call('GET', '/api/transformations'); assert.equal(list.body.length, 2);
 
   // 7. scans, explain, monitors
-  const scans = await call('GET', '/api/scans');
-  assert.ok(scans.body.length >= 10 && scans.body.every((x) => !x.error), JSON.stringify(scans.body.filter((x) => x.error)));
+  let scans = await call('GET', '/api/scans');
+  for (let i = 0; i < 50 && (scans.body.refreshing || scans.body.scans.some((x) => x.pending)); i++) {
+    await new Promise((r) => setTimeout(r, 200)); scans = await call('GET', '/api/scans');
+  }
+  assert.ok(scans.body.scans.length >= 10 && scans.body.scans.every((x) => !x.error && !x.pending), JSON.stringify(scans.body.scans.filter((x) => x.error || x.pending)));
   const opened = await call('POST', '/api/scans/red_flag_filings/open');
   assert.equal(opened.body.version.author, 'system'); assert.ok(opened.body.preview.rows.length > 0);
   assert.ok(opened.body.version.assumptions.every((a) => a.line > 1), 'scan notes resolve to real lines');
